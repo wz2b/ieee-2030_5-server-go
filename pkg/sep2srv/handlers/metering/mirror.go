@@ -21,6 +21,7 @@ import (
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2/encoding"
 	coreedev "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/enddevice"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/identity"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/idmint"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/srverr"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
@@ -33,6 +34,19 @@ import (
 // threading this callback through at construction time (same pattern
 // as the subscription manager's NotificationObserver from Phase D1).
 type LFDIProvider func(ctx context.Context) (lfdi string, ok bool)
+
+// require returns the caller's LFDI, or answers 403 and returns false when the
+// provider is unwired or the request has no (or an empty) identity. An unwired
+// provider is a closed door, not a nil-func panic and not an open one.
+func (p LFDIProvider) require(w http.ResponseWriter, r *http.Request) (string, bool) {
+	if p == nil {
+		log.Printf("metering: nil LFDIProvider, denying (route=%s)", srverr.Route(r))
+		http.Error(w, "identity required", http.StatusForbidden)
+		return "", false
+	}
+	lfdi, ok := p(r.Context())
+	return lfdi, identity.Require(w, lfdi, ok)
+}
 
 // PostRateProvider resolves the server's preferred postRate, in seconds, for
 // the client identified by lfdi, and reports whether the server has an
@@ -274,17 +288,8 @@ func authorizeMirrorOwner(
 ) (sep2.MirrorUsagePoint, string, bool) {
 	var zero sep2.MirrorUsagePoint
 
-	if lfdiProvider == nil {
-		// A consumer that wired no identity source gets a closed door, not a
-		// nil-func panic and not an open one.
-		log.Printf("mup: nil LFDIProvider, denying (route=%s)", srverr.Route(r))
-		http.Error(w, "identity required", http.StatusForbidden)
-		return zero, "", false
-	}
-
-	lfdi, ok := lfdiProvider(r.Context())
-	if !ok || lfdi == "" {
-		http.Error(w, "identity required", http.StatusForbidden)
+	lfdi, ok := lfdiProvider.require(w, r)
+	if !ok {
 		return zero, "", false
 	}
 
@@ -752,12 +757,8 @@ func HandleCreateMirrorUsagePoint(
 			return
 		}
 
-		lfdi, ok := lfdiProvider(r.Context())
-		if !ok || lfdi == "" {
-			// An empty-but-present identity would key every such caller onto
-			// one derived id, collapsing them back into the shared-record
-			// defect this handler exists to prevent. Fail closed instead.
-			http.Error(w, "identity required", http.StatusForbidden)
+		lfdi, ok := lfdiProvider.require(w, r)
+		if !ok {
 			return
 		}
 
@@ -970,6 +971,45 @@ func HandleMirrorUsagePoint(
 	}
 }
 
+// HandleMirrorMeterReading returns a handler for GET /mup/{id}/mr/{mrId}, the
+// address POST /mup/{id} and POST /mup/{id}/mr return in Location. The WADL
+// requires that Location (sep_wadl.xml:2314) but declares no resource for it,
+// so the server serves the record it just stored rather than leave the header
+// naming nothing.
+//
+// It is owner-scoped like every other /mup route: the gate runs on the parent
+// MirrorUsagePoint first, so a reading is as private as the mirror it hangs on.
+func HandleMirrorMeterReading(
+	mupStore store.ResourceStore[sep2.MirrorUsagePoint],
+	mmrStore store.ScopedReader[sep2.MirrorMeterReading],
+	managers store.EndDeviceManagementReader,
+	lfdiProvider LFDIProvider,
+	opts ...MirrorOption,
+) http.HandlerFunc {
+	actFor := newMirrorActor(managers, opts...)
+	denials := newMirrorDenialLog(log.Printf)
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			encoding.MethodNotAllowed(w, "GET, HEAD")
+			return
+		}
+		parentID := r.PathValue("id")
+		if _, _, ok := authorizeMirrorOwner(w, r, mupStore, actFor, denials, lfdiProvider, parentID); !ok {
+			return
+		}
+		mmr, err := mmrStore.Get(r.Context(), parentID, r.PathValue("mrId"))
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(w, "mirror meter reading not found", http.StatusNotFound)
+				return
+			}
+			srverr.Internal(w, r, fmt.Errorf("read mirror meter reading: %w", err))
+			return
+		}
+		encoding.WriteXML(w, http.StatusOK, &mmr)
+	}
+}
+
 // HandlePutMirrorUsagePoint returns a handler for PUT /mup/{id}.
 //
 // PUT on the MirrorUsagePoint is mode M in the WADL (sep_wadl.xml:2303), and
@@ -1175,27 +1215,7 @@ func HandlePutMirrorUsagePoint(
 // deployment choice, not an indeterminate check.
 //
 // A readings store that IS wired but cannot cascade is the opposite case and is
-// treated as an error: see [parentCascader].
-
-// parentCascader removes a whole parent collection in one operation and reports
-// how many resources went with it.
-//
-// It is declared HERE, at the consumer, rather than in pkg/store, because it is
-// not part of the store contract and should not become part of it by accident.
-// The contract addresses resources as (parent, id) pairs and offers no key
-// enumeration, so a cascade cannot be expressed as a loop over it: there is no
-// way to ask which ids live under a parent, and a loop would not be atomic even
-// if there were. That makes bulk parent removal a capability an implementation
-// either has or does not, which is exactly what an optional interface asserted
-// at the point of use is for.
-//
-// An implementation that does not provide it is not silently tolerated. See the
-// fail-closed branch in [HandleDeleteMirrorUsagePoint]: a store that cannot
-// cascade blocks the parent delete rather than completing it and orphaning the
-// children.
-type parentCascader interface {
-	DeleteParent(ctx context.Context, parentID string) (uint32, error)
-}
+// treated as an error: see [store.CascadeParent].
 
 func HandleDeleteMirrorUsagePoint(
 	s store.ResourceStore[sep2.MirrorUsagePoint],
@@ -1224,23 +1244,11 @@ func HandleDeleteMirrorUsagePoint(
 		}
 
 		if !store.IsAbsent(mmrStore) {
-			cascader, ok := mmrStore.(parentCascader)
-			if !ok {
-				// Fail closed, and leave the parent in place. The readings
-				// store is wired, so a collection under this id may exist and
-				// would be orphaned by a delete this handler cannot follow
-				// with a cascade. Answering 204 here would report a clean
-				// deletion while leaving exactly the state the cascade exists
-				// to prevent, and the client could not tell.
-				srverr.Internal(w, r, fmt.Errorf("the readings store (%T) cannot cascade a parent delete, "+
-					"so the MirrorUsagePoint is left in place", mmrStore))
-				return
-			}
-			removed, err := cascader.DeleteParent(r.Context(), id)
+			// Fail closed, and leave the parent in place: the readings store is
+			// wired, so a collection under this id may exist and would be orphaned
+			// by a delete this handler cannot follow with a cascade.
+			removed, err := store.CascadeParent(r.Context(), mmrStore, id)
 			if err != nil {
-				// The parent is deliberately still here. Surfacing the failure
-				// with the resource intact is recoverable; deleting it anyway
-				// would leave orphans no client could see or clean up.
 				srverr.Internal(w, r, fmt.Errorf("the cascade delete of the readings under this parent failed, "+
 					"so the MirrorUsagePoint is left in place: %w", err))
 				return

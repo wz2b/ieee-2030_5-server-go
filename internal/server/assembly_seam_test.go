@@ -43,7 +43,7 @@ import (
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store/memory"
 )
 
-// canonicalProtocolRoutes is the pinned list of 72 SEP2 protocol-listener
+// canonicalProtocolRoutes is the pinned list of 74 SEP2 protocol-listener
 // patterns that assembly.BuildProtocolRouter must mount. Confirmed
 // identical to the in-tree BuildProtocolRouter output by Phase 1
 // (TestCoreRouterPatternEquivalence). Any addition or deletion from this
@@ -117,22 +117,45 @@ import (
 //
 // PUT on the FlowReservationRequest instance is ADDED (#667): the client's
 // cancel. 71 -> 72.
+//
+// PUT and DELETE on the Registration are ADDED (#1263), behind the
+// manager-only check. 72 -> 74.
+//
+// GET and PUT on the Subscription instance are ADDED (#1267): the Location
+// POST /edev/{id}/sub returns was read and replaced with 405 until now. The
+// list's own header count and the two figures above stop at #1263; the pinned
+// total is the length of this list, asserted by TestProtocolRouteSurface.
+//
+// DELETE on the DeviceStatus and PUT on the LogEvent instance are ADDED
+// (#1264, first slice). DELETE on the FlowReservationRequest instance is
+// ADDED (#1264, second slice).
 var canonicalProtocolRoutes = []string{
 	"DELETE /edev/{id}",
+	"DELETE /edev/{id}/dstat",
+	"DELETE /edev/{id}/frq/{frqId}",
 	"DELETE /edev/{id}/lel/{lelId}",
+	"DELETE /edev/{id}/rg",
 	"DELETE /edev/{id}/sub/{subId}",
 	"DELETE /mup/{id}",
+	"DELETE /upt/{uptId}",
+	"DELETE /upt/{uptId}/mr/{mrId}",
+	"DELETE /upt/{uptId}/mr/{mrId}/rs/{rsId}",
+	"DELETE /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}",
 	"GET /dc",
+	"GET /dc/{dcId}",
 	"GET /dcap",
 	"GET /edev",
 	"GET /edev/{id}",
 	"GET /edev/{id}/cfg",
 	"GET /edev/{id}/der",
 	"GET /edev/{id}/der/{derId}",
+	"GET /edev/{id}/der/{derId}/cdp",
 	"GET /edev/{id}/der/{derId}/dera",
 	"GET /edev/{id}/der/{derId}/dercap",
 	"GET /edev/{id}/der/{derId}/derg",
+	"GET /edev/{id}/der/{derId}/derp",
 	"GET /edev/{id}/der/{derId}/ders",
+	"GET /edev/{id}/der/{derId}/upt",
 	"GET /edev/{id}/dstat",
 	"GET /edev/{id}/frp",
 	"GET /edev/{id}/frp/{frpId}",
@@ -142,6 +165,9 @@ var canonicalProtocolRoutes = []string{
 	"GET /edev/{id}/fsa/{fsaId}",
 	"GET /edev/{id}/fsa/{fsaId}/derp",
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}",
+	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/actderc",
+	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dc",
+	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dc/{dcId}",
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dderc",
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/derc",
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/derc/{dercId}",
@@ -150,12 +176,15 @@ var canonicalProtocolRoutes = []string{
 	"GET /edev/{id}/ps",
 	"GET /edev/{id}/rg",
 	"GET /edev/{id}/sub",
+	"GET /edev/{id}/sub/{subId}",
 	"GET /msg",
 	"GET /msg/{msgId}",
+	"GET /msg/{msgId}/acttm",
 	"GET /msg/{msgId}/tm",
 	"GET /msg/{msgId}/tm/{tmId}",
 	"GET /mup",
 	"GET /mup/{id}",
+	"GET /mup/{id}/mr/{mrId}",
 	"GET /rsps",
 	"GET /rsps/{rspsId}",
 	"GET /rsps/{rspsId}/rsp",
@@ -168,7 +197,13 @@ var canonicalProtocolRoutes = []string{
 	"GET /upt",
 	"GET /upt/{uptId}",
 	"GET /upt/{uptId}/mr",
+	"GET /upt/{uptId}/mr/{mrId}",
 	"GET /upt/{uptId}/mr/{mrId}/r",
+	"GET /upt/{uptId}/mr/{mrId}/rs",
+	"GET /upt/{uptId}/mr/{mrId}/rs/{rsId}",
+	"GET /upt/{uptId}/mr/{mrId}/rs/{rsId}/r",
+	"GET /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}",
+	"GET /upt/{uptId}/mr/{mrId}/rt",
 	"POST /edev",
 	"POST /edev/{id}/frq",
 	"POST /edev/{id}/lel",
@@ -177,6 +212,7 @@ var canonicalProtocolRoutes = []string{
 	"POST /mup",
 	"POST /mup/{id}",
 	"POST /mup/{id}/mr",
+	"POST /ntfy",
 	"POST /rsps/{rspsId}/rsp",
 	"POST /upt",
 	"PUT /edev/{id}",
@@ -188,13 +224,18 @@ var canonicalProtocolRoutes = []string{
 	"PUT /edev/{id}/der/{derId}/ders",
 	"PUT /edev/{id}/dstat",
 	"PUT /edev/{id}/frq/{frqId}",
+	"PUT /edev/{id}/lel/{lelId}",
 	"PUT /edev/{id}/ps",
+	"PUT /edev/{id}/rg",
+	"PUT /edev/{id}/sub/{subId}",
 	"PUT /mup/{id}",
+	"PUT /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}",
+	"PUT /upt/{uptId}/mr/{mrId}/rt",
 }
 
 // TestProtocolRouteSurface asserts that BuildProtocolRouter (which now
 // delegates unconditionally to assembly.BuildProtocolRouter) produces
-// exactly the 72 canonical SEP2 protocol routes, sorted, with no
+// exactly the 74 canonical SEP2 protocol routes, sorted, with no
 // additions or deletions. This replaces TestCoreRouterPatternEquivalence
 // from Phase 1: there is no longer an in-tree router to compare against,
 // so we pin the live surface directly.
@@ -344,6 +385,7 @@ func TestNewCoreStoresCopiesAllFields(t *testing.T) {
 	// re-set it here anyway so this test does not silently depend on that
 	// default and stays a self-contained proof that the copy works.
 	src.EndDeviceManagers = memory.NewEndDeviceManagementStore()
+	src.FlowReservationAnswers = memory.NewScopedStore[flowreservation.AnswerRecord]()
 	// Set on this src alone: a queue in the shared fixture would replace the
 	// per-router deadline every other test in the package relies on.
 	src.FlowReservationQueue = flowreservation.NewQueue(

@@ -128,8 +128,9 @@ func fakeStores() *assembly.Stores {
 
 		UsagePoints:   storetest.NewFake[sep2.UsagePoint](),
 		MeterReadings: storetest.NewScopedFake[sep2.MeterReading](),
+		ReadingSets:   storetest.NewScopedFake[sep2.ReadingSet](),
 		Readings:      storetest.NewScopedFake[sep2.Reading](),
-		ReadingTypes:  storetest.NewFake[sep2.ReadingType](),
+		ReadingTypes:  storetest.NewScopedFake[sep2.ReadingType](),
 
 		Configurations:           storetest.NewScopedFake[sep2.Configuration](),
 		DeviceStatuses:           storetest.NewScopedFake[sep2.DeviceStatus](),
@@ -167,6 +168,13 @@ func TestSecondImplementation_FlatStoreServesPostAndGet(t *testing.T) {
 	t.Parallel()
 
 	stores := fakeStores()
+	// POST /upt is for a manager certificate, which the test identity becomes
+	// by managing one device that exists.
+	stores.EndDeviceManagers = memory.NewEndDeviceManagementStore()
+	if err := stores.EndDeviceManagers.Assign(context.Background(), testLFDI, faultProbeManagedLFDI); err != nil {
+		t.Fatalf("assign the manager: %v", err)
+	}
+	seedDevice(t, stores.EndDevices, faultProbeManagedID, faultProbeManagedLFDI, "")
 	srv := fakeBackedServer(t, stores)
 
 	const body = `<UsagePoint xmlns="urn:ieee:std:2030.5:ns">` +

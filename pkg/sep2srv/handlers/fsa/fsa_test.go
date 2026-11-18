@@ -13,6 +13,7 @@ import (
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
 	corefsa "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/fsa"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/idmint/idminttest"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/routefamily"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store/memory"
 )
@@ -26,7 +27,7 @@ func TestHandleFSA_NotFoundReturnsDefault(t *testing.T) {
 
 	fsaStore := memory.NewScopedStore[sep2.FunctionSetAssignments]()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", corefsa.HandleFSA(fsaStore))
+	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", corefsa.HandleFSA(fsaStore, allWired))
 
 	req := httptest.NewRequest(http.MethodGet, "/edev/e1/fsa/f1", nil)
 	w := httptest.NewRecorder()
@@ -58,9 +59,8 @@ func TestHandleFSA_StoredValueReturned(t *testing.T) {
 
 	fsaStore := memory.NewScopedStore[sep2.FunctionSetAssignments]()
 	fsa := sep2.FunctionSetAssignments{
-		Resource:    sep2.Resource{Href: "/edev/e1/fsa/f1"},
-		MRID:        "fsa-mrid-01",
-		Description: "Test FSA",
+		Resource:         sep2.Resource{Href: "/edev/e1/fsa/f1"},
+		IdentifiedObject: sep2.IdentifiedObject{MRID: "fsa-mrid-01", Description: "Test FSA"},
 		FunctionSetAssignmentsBase: sep2.FunctionSetAssignmentsBase{
 			DERProgramListLink: &sep2.ListLink{
 				Href: "/edev/e1/fsa/f1/derp",
@@ -72,7 +72,7 @@ func TestHandleFSA_StoredValueReturned(t *testing.T) {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", corefsa.HandleFSA(fsaStore))
+	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", corefsa.HandleFSA(fsaStore, allWired))
 
 	req := httptest.NewRequest(http.MethodGet, "/edev/e1/fsa/f1", nil)
 	w := httptest.NewRecorder()
@@ -95,7 +95,7 @@ func TestHandleFSA_MethodNotAllowed(t *testing.T) {
 	t.Parallel()
 
 	fsaStore := memory.NewScopedStore[sep2.FunctionSetAssignments]()
-	h := corefsa.HandleFSA(fsaStore)
+	h := corefsa.HandleFSA(fsaStore, allWired)
 
 	req := httptest.NewRequest(http.MethodPost, "/edev/e1/fsa/f1", nil)
 	w := httptest.NewRecorder()
@@ -176,4 +176,36 @@ func TestHandleCreateFSA_ParallelPostsGetDistinctIDs(t *testing.T) {
 	idminttest.AssertParallelCreatesDistinct(t, mux, 16, func() *http.Request {
 		return httptest.NewRequest(http.MethodPost, "/api/fsa?edevId=e1", nil)
 	})
+}
+
+func allWired(routefamily.Anchor) bool { return true }
+
+// TestHandleFSA_DefaultCarriesAStableMRID: the synthetic default names itself
+// with a 32-digit mRID, the same on every request for the same FSA and
+// different for another FSA (#1299).
+func TestHandleFSA_DefaultCarriesAStableMRID(t *testing.T) {
+	t.Parallel()
+
+	h := corefsa.HandleFSA(memory.NewScopedStore[sep2.FunctionSetAssignments](), allWired)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", h)
+	get := func(path string) string {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		var got sep2.FunctionSetAssignments
+		if err := xml.Unmarshal(w.Body.Bytes(), &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return got.MRID
+	}
+	a1, a2, b := get("/edev/e1/fsa/f1"), get("/edev/e1/fsa/f1"), get("/edev/e1/fsa/f2")
+	if len(a1) != 32 {
+		t.Fatalf("mRID = %q, want 32 hex digits", a1)
+	}
+	if a1 != a2 {
+		t.Errorf("mRID changed between requests: %q then %q", a1, a2)
+	}
+	if a1 == b {
+		t.Errorf("two FSAs share mRID %q", a1)
+	}
 }

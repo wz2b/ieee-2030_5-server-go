@@ -77,13 +77,31 @@ func newManagementFleet(t *testing.T) managementFleet {
 func seedManagedSubResources(t *testing.T, stores *assembly.Stores, edevID string) {
 	t.Helper()
 	ctx := context.Background()
-	seedDER(t, stores, edevID, edevID)
+	der := seedDER(t, stores, edevID, edevID)
+	progHref := "/edev/" + edevID + "/fsa/" + edevID + "/derp/" + edevID
 	if err := stores.DERPrograms.Create(ctx, edevID, edevID, sep2.DERProgram{
 		SubscribableResource: sep2.SubscribableResource{
-			Resource: sep2.Resource{Href: "/edev/" + edevID + "/fsa/" + edevID + "/derp/" + edevID},
+			Resource: sep2.Resource{Href: progHref},
 		},
 	}); err != nil {
 		t.Fatalf("seed DERProgram: %v", err)
+	}
+	// The association records the cdp and upt routes resolve, and the usage
+	// point and curve behind them, so those reads answer 200 for the owner.
+	der.CurrentDERProgramLink = &sep2.Link{Href: progHref}
+	der.AssociatedUsagePointLink = &sep2.Link{Href: "/upt/" + edevID}
+	if err := stores.DERs.Update(ctx, edevID, edevID, der); err != nil {
+		t.Fatalf("seed DER associations: %v", err)
+	}
+	if err := stores.UsagePoints.Create(ctx, edevID, sep2.UsagePoint{
+		SubscribableResource: sep2.SubscribableResource{Resource: sep2.Resource{Href: "/upt/" + edevID}},
+	}); err != nil {
+		t.Fatalf("seed UsagePoint: %v", err)
+	}
+	if err := stores.DERCurves.Create(ctx, edevID, sep2.DERCurve{
+		Resource: sep2.Resource{Href: "/dc/" + edevID},
+	}); err != nil {
+		t.Fatalf("seed DERCurve: %v", err)
 	}
 	seedDERControl(t, stores, edevID, edevID, 0, 1700000000)
 	if err := stores.LogEvents.Create(ctx, edevID, edevID, sep2.LogEvent{
@@ -215,6 +233,14 @@ var managerWriteAllowlist = map[string]bool{
 	"POST /edev/{id}/lel":               true, // LogEvent, CSIP V1.2 UTIL-001
 }
 
+// managerOnlyWritePatterns names the writes below a record that a manager certificate
+// makes on a device it manages, by the manager-only check (#1263) rather than by
+// delegation: the owner is refused them, and a manager is not.
+var managerOnlyWritePatterns = map[string]bool{
+	"PUT /edev/{id}/rg":    true,
+	"DELETE /edev/{id}/rg": true,
+}
+
 // sweepStatus drives pattern, every wildcard set explicitly to victimID (the
 // managed device this fleet's pairs name), on a fresh fleet so one caller's
 // write cannot change the other's answer. It names victimID directly rather
@@ -292,10 +318,20 @@ func TestManagement_ManagerWriteFollowsTheAllowlistNotTheOwner(t *testing.T) {
 		t.Fatal("no write-below-record pattern found; the sweep would pass vacuously")
 	}
 
-	var granted, refused int
+	var granted, refused, managerOnly int
 	for _, p := range writes {
 		owner := sweepStatus(t, p, victimLFDI)
 		manager := sweepStatus(t, p, managerLFDI)
+		if managerOnlyWritePatterns[p] {
+			managerOnly++
+			if owner != http.StatusForbidden {
+				t.Errorf("%s: manager-only; the owner answered %d, want 403", p, owner)
+			}
+			if manager == http.StatusForbidden || manager == http.StatusMethodNotAllowed {
+				t.Errorf("%s: manager-only; the manager answered %d, want the write served", p, manager)
+			}
+			continue
+		}
 		if managerWriteAllowlist[p] {
 			granted++
 			// The degenerate-owner guard applies only here: the refused half
@@ -327,6 +363,9 @@ func TestManagement_ManagerWriteFollowsTheAllowlistNotTheOwner(t *testing.T) {
 	}
 	if refused == 0 {
 		t.Error("no non-allow-listed write pattern was swept; the control that a write can still be refused never ran")
+	}
+	if managerOnly != len(managerOnlyWritePatterns) {
+		t.Errorf("swept %d manager-only write patterns, want all %d reachable through the mounted routes", managerOnly, len(managerOnlyWritePatterns))
 	}
 	t.Logf("swept %d write-below-record patterns of %d mounted: %d allow-listed (granted), %d refused", len(writes), len(patterns), granted, refused)
 }

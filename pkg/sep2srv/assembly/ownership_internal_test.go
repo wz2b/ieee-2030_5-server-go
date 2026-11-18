@@ -15,6 +15,7 @@ import (
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/commitment/sources"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/dercontrol"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/flowreservation"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store/memory"
 )
 
@@ -124,8 +125,9 @@ func fullStores() *Stores {
 		Subscriptions:            memory.NewSubscriptionStore(),
 		UsagePoints:              memory.NewStore[sep2.UsagePoint](),
 		MeterReadings:            memory.NewScopedStore[sep2.MeterReading](),
+		ReadingSets:              memory.NewScopedStore[sep2.ReadingSet](),
 		Readings:                 memory.NewScopedStore[sep2.Reading](),
-		ReadingTypes:             memory.NewStore[sep2.ReadingType](),
+		ReadingTypes:             memory.NewScopedStore[sep2.ReadingType](),
 		Configurations:           memory.NewScopedStore[sep2.Configuration](),
 		DeviceStatuses:           memory.NewScopedStore[sep2.DeviceStatus](),
 		LogEvents:                memory.NewScopedStore[sep2.LogEvent](),
@@ -138,6 +140,7 @@ func fullStores() *Stores {
 		Responses:                memory.NewScopedStore[sep2.Response](),
 
 		FlowReservationResponseLifecycles: memory.NewScopedStore[dercontrol.LifecycleRecord](),
+		FlowReservationAnswers:            memory.NewScopedStore[flowreservation.AnswerRecord](),
 	}
 	s.CommitmentLedger = sources.NewLedger(
 		s.EndDevices, s.EndDeviceManagers,
@@ -151,7 +154,7 @@ func registerAll(mux routeRegistrar, stores *Stores, policy AuthPolicy) {
 	registerEndDeviceRoutes(mux, stores, policy, nil, nil, false, nil)
 	registerMirrorRoutes(mux, stores, policy, nil)
 	registerDERRoutes(mux, stores)
-	registerMeteringRoutes(mux, stores)
+	registerMeteringRoutes(mux, stores, policy)
 	registerNewFunctionSetRoutes(mux, stores, nil, 0, 0, nil, nil, nil, nil)
 }
 
@@ -226,9 +229,12 @@ func TestDelegable(t *testing.T) {
 		"PUT /edev/{id}/der/{derId}":                  false, // refused: UTIL-002 names only the four DER sub-resources
 		"PUT /edev/{id}/cfg":                          false, // refused: no aggregator text, IEEE 2030.5-2018 8.5.3 default
 		"PUT /edev/{id}/dstat":                        false, // refused: no aggregator text, IEEE 2030.5-2018 8.5.3 default
+		"DELETE /edev/{id}/dstat":                     false, // refused: no aggregator text, IEEE 2030.5-2018 8.5.3 default
+		"PUT /edev/{id}/lel/{lelId}":                  false, // refused: no aggregator text replaces a LogEvent
 		"PUT /edev/{id}/ps":                           false, // refused: no aggregator text, IEEE 2030.5-2018 8.5.3 default
 		"POST /edev/{id}/frq":                         false, // refused: flow reservation appears in no aggregator text
 		"PUT /edev/{id}/frq/{frqId}":                  false, // refused: a client's own withdrawal, not an aggregator act (#667)
+		"DELETE /edev/{id}/frq/{frqId}":               false, // refused: flow reservation appears in no aggregator text
 		// A write pattern nobody has registered yet: proves the default is
 		// denied, not merely that today's five entries are granted.
 		"PUT /edev/{id}/notyetregistered": false,
@@ -249,16 +255,26 @@ func TestDelegable(t *testing.T) {
 var managerVerdicts = map[string]bool{
 	"GET /edev/{id}":    true,
 	"GET /edev/{id}/rg": false,
-	"PUT /edev/{id}":    false,
-	"DELETE /edev/{id}": true, // CSIP MAINT-002: a manager deletes a device it manages
+	// Not delegation: a manager certificate makes these through
+	// managerOnlyWrites, on a device it manages.
+	"PUT /edev/{id}/rg":    false,
+	"DELETE /edev/{id}/rg": false,
+	"PUT /edev/{id}":       false,
+	"DELETE /edev/{id}":    true, // CSIP MAINT-002: a manager deletes a device it manages
 
 	"GET /edev/{id}/fsa":                                     true,
 	"GET /edev/{id}/fsa/{fsaId}":                             true,
 	"GET /edev/{id}/fsa/{fsaId}/derp":                        true,
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}":               true,
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/derc":          true,
+	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/actderc":       true,
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/derc/{dercId}": true,
 	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dderc":         true,
+	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dc":            true,
+	"GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dc/{dcId}":     true,
+	"GET /edev/{id}/der/{derId}/derp":                        true,
+	"GET /edev/{id}/der/{derId}/cdp":                         true,
+	"GET /edev/{id}/der/{derId}/upt":                         true,
 	// The PUT route a closed defect (#456) once refused was removed from the
 	// mux entirely, so no pattern exists here for it to name.
 
@@ -277,27 +293,32 @@ var managerVerdicts = map[string]bool{
 	"GET /edev/{id}/sub":            true,  // a manager reads what the managed device reads
 	"POST /edev/{id}/sub":           false, // not the aggregator's own SubscriptionListLink
 	"DELETE /edev/{id}/sub/{subId}": false, // not the aggregator's own SubscriptionListLink
+	"GET /edev/{id}/sub/{subId}":    true,  // a manager reads what the managed device reads
+	"PUT /edev/{id}/sub/{subId}":    false, // not the aggregator's own SubscriptionListLink
 
 	"GET /edev/{id}/cfg": true,
 	"PUT /edev/{id}/cfg": false, // no aggregator text, IEEE 2030.5-2018 8.5.3 default
 
-	"GET /edev/{id}/dstat": true,
-	"PUT /edev/{id}/dstat": false, // no aggregator text, IEEE 2030.5-2018 8.5.3 default
+	"GET /edev/{id}/dstat":    true,
+	"PUT /edev/{id}/dstat":    false, // no aggregator text, IEEE 2030.5-2018 8.5.3 default
+	"DELETE /edev/{id}/dstat": false, // no aggregator text, IEEE 2030.5-2018 8.5.3 default
 
 	"GET /edev/{id}/lel":            true,
 	"POST /edev/{id}/lel":           true, // LogEvent, CSIP V1.2 UTIL-001
 	"GET /edev/{id}/lel/{lelId}":    true,
 	"DELETE /edev/{id}/lel/{lelId}": false, // no aggregator text deletes a LogEvent
+	"PUT /edev/{id}/lel/{lelId}":    false, // no aggregator text replaces a LogEvent
 
 	"GET /edev/{id}/ps": true,
 	"PUT /edev/{id}/ps": false, // no aggregator text, IEEE 2030.5-2018 8.5.3 default
 
-	"GET /edev/{id}/frq":         true,
-	"GET /edev/{id}/frq/{frqId}": true,
-	"POST /edev/{id}/frq":        false, // flow reservation appears in no aggregator text
-	"PUT /edev/{id}/frq/{frqId}": false, // a client's own withdrawal (#667); an aggregator may not place a bid, so it may not cancel one
-	"GET /edev/{id}/frp":         true,
-	"GET /edev/{id}/frp/{frpId}": true,
+	"GET /edev/{id}/frq":            true,
+	"GET /edev/{id}/frq/{frqId}":    true,
+	"POST /edev/{id}/frq":           false, // flow reservation appears in no aggregator text
+	"PUT /edev/{id}/frq/{frqId}":    false, // a client's own withdrawal (#667); an aggregator may not place a bid, so it may not cancel one
+	"DELETE /edev/{id}/frq/{frqId}": false, // flow reservation appears in no aggregator text
+	"GET /edev/{id}/frp":            true,
+	"GET /edev/{id}/frp/{frpId}":    true,
 }
 
 // TestManagerVerdictForEveryGatedPattern is issue 510's acceptance

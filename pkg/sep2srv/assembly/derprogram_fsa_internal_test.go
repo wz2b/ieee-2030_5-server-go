@@ -28,7 +28,7 @@ func seedViewPrograms(t *testing.T, hrefs map[string]string) store.ScopedStore[s
 	t.Helper()
 	s := memory.NewScopedStore[sep2.DERProgram]()
 	for id, href := range hrefs {
-		p := sep2.DERProgram{MRID: "M-" + id}
+		p := sep2.DERProgram{IdentifiedObject: sep2.IdentifiedObject{MRID: "M-" + id}}
 		p.Href = href
 		if err := s.Create(context.Background(), "e1", id, p); err != nil {
 			t.Fatalf("seed %s: %v", id, err)
@@ -129,5 +129,21 @@ func TestProgramsInFSA_UnscopedHrefIsServedNowhereAndLoggedOnce(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Errorf("logs %q do not name %s", logs.lines, want)
 		}
+	}
+}
+
+// A view built for one FSA with an empty id matches no program: an unset
+// {fsaId} must narrow to nothing, never widen to every FSA.
+func TestProgramsInFSA_EmptyFSAIDMatchesNothing(t *testing.T) {
+	t.Parallel()
+	programs := seedViewPrograms(t, map[string]string{"p1": "/edev/e1/fsa/f1/derp/p1", "p2": "/edev/e1/fsa/f2/derp/p2"})
+	v := programsInFSA{ScopedStore: programs, fsaID: "", warn: newUnscopedProgramWarnings(t.Logf)}
+	ctx := context.Background()
+	if _, err := v.Get(ctx, "e1", "p1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("Get under an empty fsaID: err = %v, want ErrNotFound", err)
+	}
+	res, err := v.List(ctx, "e1", store.ListOptions{Unbounded: true})
+	if err != nil || res.All != 0 || len(res.Items) != 0 {
+		t.Errorf("List under an empty fsaID = %+v, %v; want nothing", res, err)
 	}
 }

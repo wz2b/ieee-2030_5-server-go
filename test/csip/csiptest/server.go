@@ -48,6 +48,7 @@ import (
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/config"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/handler"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/server"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/devicelog"
 	coresub "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/subscription"
 )
 
@@ -94,6 +95,7 @@ type bootCfg struct {
 	clientCert    *tls.Certificate         // if nil, helper generates an ephemeral device cert
 	clientCAsPath string                   // if non-empty, overrides the ClientCAs file fed to the server-side TLS config
 	notifier      handler.ResourceNotifier // if nil, BootServer wires a default subscription.Manager bound to Stores.Subscriptions (#157)
+	deviceLog     bool                     // if true, BootServer runs a device log writer in a temp dir
 }
 
 // BootOption configures BootServer. Apply via the functional-options
@@ -107,6 +109,13 @@ type BootOption func(*bootCfg)
 // a working /dcap that returns an empty resource graph.
 func WithStores(s *server.Stores) BootOption {
 	return func(c *bootCfg) { c.stores = s }
+}
+
+// WithDeviceLog boots the server with a device log writer on a temporary
+// directory, for the routes that record into it (POST /ntfy). Without it they
+// answer 503.
+func WithDeviceLog() BootOption {
+	return func(c *bootCfg) { c.deviceLog = true }
 }
 
 // WithServerConfig overrides the default *config.Config. The default
@@ -335,7 +344,22 @@ func BootServer(t *testing.T, opts ...BootOption) *BootedServer {
 		notifier = mgr
 	}
 
-	router, mountedPatterns := server.BuildProtocolRouter(cfg.serverConfig, cfg.stores, nil, serverSFDI, serverLFDI, notifier)
+	var deviceLog *devicelog.Writer
+	if cfg.deviceLog {
+		w, err := devicelog.New(devicelog.Config{Dir: t.TempDir(), MaxBytes: 1 << 20})
+		if err != nil {
+			t.Fatalf("csiptest: device log: %v", err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := w.Close(ctx); err != nil {
+				t.Logf("csiptest: device log close: %v", err)
+			}
+		})
+		deviceLog = w
+	}
+	router, mountedPatterns := server.BuildProtocolRouterLogged(cfg.serverConfig, cfg.stores, nil, serverSFDI, serverLFDI, notifier, deviceLog)
 
 	sepTLS.SetupCCMServer(httpSrv)
 	httpSrv.Handler = sepTLS.CCMIdentityMiddleware(router)
@@ -403,8 +427,12 @@ func (b *BootedServer) HTTPClientFor(cert tls.Certificate) *http.Client {
 	}
 }
 
+// ManagedDeviceID is the store id of the device NewManagerClient seeds and
+// assigns to its manager.
+const ManagedDeviceID = "csiptest-managed"
+
 // NewManagerClient mints a second device certificate from this server's CA,
-// records it as the manager of a third, absent device, and returns a client
+// records it as the manager of a third device, whose record it seeds, and returns a client
 // presenting it. It is the manager identity a test uses to make writes the
 // server restricts to a manager, next to Client() as the ordinary device.
 //
@@ -420,12 +448,33 @@ func (b *BootedServer) NewManagerClient(t *testing.T) *http.Client {
 	}
 	cert := mustGenerateDeviceCert(t, b.caCertPEM, b.caKeyPEM, "CSIPTEST-MANAGER-001")
 	managedCert := mustGenerateDeviceCert(t, b.caCertPEM, b.caKeyPEM, "CSIPTEST-MANAGED-001")
-	_, managed := deriveServerIdentity(t, managedCert.Certificate)
+	managedSFDI, managed := deriveServerIdentity(t, managedCert.Certificate)
 	_, managerLFDI := deriveServerIdentity(t, cert.Certificate)
+	if b.Stores.EndDevices != nil {
+		// The pair counts only while the device exists, so the manager-only
+		// writes need its record.
+		enabled := true
+		dev := sep2.EndDevice{LFDI: managed, SFDI: managedSFDI, Enabled: &enabled}
+		dev.Href = "/edev/" + ManagedDeviceID
+		if err := b.Stores.EndDevices.Create(context.Background(), ManagedDeviceID, dev); err != nil {
+			t.Fatalf("csiptest: seed the managed device %s: %v", managed, err)
+		}
+	}
 	if err := b.Stores.EndDeviceManagers.Assign(context.Background(), managerLFDI, managed); err != nil {
 		t.Fatalf("csiptest: assign manager %s of device %s: %v", managerLFDI, managed, err)
 	}
 	return b.HTTPClientFor(cert)
+}
+
+// NewDeviceClient mints another ordinary device certificate from this server's
+// CA and returns a client presenting it, with the SFDI and LFDI the server derives
+// from it. It is the second device a test needs next to Client() to show one device
+// cannot act as, or see, another. The device holds no management pair.
+func (b *BootedServer) NewDeviceClient(t *testing.T, hwSerial string) (client *http.Client, sfdi, lfdi string) {
+	t.Helper()
+	cert := mustGenerateDeviceCert(t, b.caCertPEM, b.caKeyPEM, hwSerial)
+	sfdi, lfdi = deriveServerIdentity(t, cert.Certificate)
+	return b.HTTPClientFor(cert), sfdi, lfdi
 }
 
 // shutdown closes the http.Server, waits for the serve goroutine to

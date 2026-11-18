@@ -5,7 +5,9 @@ import (
 	"log"
 
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/activelist"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/derhref"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/logsafe"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
 )
 
@@ -27,6 +29,48 @@ type DERControlCounter interface {
 type DERControlCountedProgramStore struct {
 	programs store.ScopedStore[sep2.DERProgram]
 	controls DERControlCounter
+	active   DERControlCounter
+	curves   curveCounter
+}
+
+// curveCounter counts the curves a program lists.
+type curveCounter interface {
+	Count(ctx context.Context) (uint32, error)
+}
+
+// WithCurveList makes the store also advertise the program's DERCurveList
+// where none is stored, as the program's own href plus /dc and an all of the
+// curve count. A stored DERCurveListLink is left as stored. Without it no link
+// is derived, since a link to a list this server does not mount is a section
+// 4.4 violation.
+func (s *DERControlCountedProgramStore) WithCurveList(curves curveCounter) *DERControlCountedProgramStore {
+	s.curves = curves
+	return s
+}
+
+// stampCurveList fills an absent DERCurveListLink. All is the whole curve
+// catalog for every program, because no store records which curves belong to
+// which program; the list route serves the same catalog. A failed count serves
+// no link rather than a wrong all.
+func (s *DERControlCountedProgramStore) stampCurveList(ctx context.Context, p *sep2.DERProgram) {
+	if s.curves == nil || p.DERCurveListLink != nil || p.Href == "" {
+		return
+	}
+	n, err := s.curves.Count(ctx)
+	if err != nil {
+		log.Printf("der: counting DERCurves for %s: %s; serving no DERCurveListLink", logsafe.Quote(p.Href), logsafe.Err(err))
+		return
+	}
+	p.DERCurveListLink = &sep2.ListLink{Href: p.Href + "/dc", All: n}
+}
+
+// WithActiveList makes the store also serve each program's
+// ActiveDERControlListLink, its all being the count active reports for the
+// same scope. Without it no active link is served, since a link to a list
+// this server does not mount is a section 4.4 violation.
+func (s *DERControlCountedProgramStore) WithActiveList(active DERControlCounter) *DERControlCountedProgramStore {
+	s.active = active
+	return s
 }
 
 // NewDERControlCountedProgramStore decorates programs with controls.
@@ -42,6 +86,7 @@ func (s *DERControlCountedProgramStore) Get(ctx context.Context, parentID, id st
 		return p, err
 	}
 	s.stampCount(ctx, &p)
+	s.stampCurveList(ctx, &p)
 	return p, nil
 }
 
@@ -52,6 +97,7 @@ func (s *DERControlCountedProgramStore) List(ctx context.Context, parentID strin
 	}
 	for i := range result.Items {
 		s.stampCount(ctx, &result.Items[i])
+		s.stampCurveList(ctx, &result.Items[i])
 	}
 	return result, nil
 }
@@ -77,6 +123,20 @@ func (s *DERControlCountedProgramStore) stampCount(ctx context.Context, p *sep2.
 		return
 	}
 	p.DERControlListLink.All = n
+	s.stampActive(ctx, p, scopeKey)
+}
+
+// stampActive serves the active list link: a stored link keeps its href and
+// has its all recomputed, an absent one is derived from the control list
+// link. A failed count serves no link rather than a wrong all.
+func (s *DERControlCountedProgramStore) stampActive(ctx context.Context, p *sep2.DERProgram, scopeKey string) {
+	if s.active == nil {
+		return
+	}
+	derive := func() (string, bool) { return derhref.ActiveControlList(p.DERControlListLink.Href) }
+	if err := activelist.StampLink(ctx, s.active, scopeKey, &p.ActiveDERControlListLink, derive); err != nil {
+		log.Printf("der: counting active DERControls for %s: %s; serving no ActiveDERControlListLink", logsafe.Quote(p.DERControlListLink.Href), logsafe.Err(err))
+	}
 }
 
 func (s *DERControlCountedProgramStore) Count(ctx context.Context, parentID string) (uint32, error) {

@@ -13,8 +13,15 @@ import (
 	"strings"
 
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/derhref"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/fsaprogram"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/server"
+	coreder "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/der"
+	coremetering "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/metering"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/sep2time"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/routefamily"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store/memory"
 )
 
 // This file walks a live IEEE 2030.5 server against the normative WADL.
@@ -138,9 +145,10 @@ type Row struct {
 	LinkElement      string   `json:"link_element,omitempty"`
 	MintedBy         string   `json:"minted_by,omitempty"`
 
-	// BodyMinimal records that the request body was a minimal, namespace-correct
-	// instance rather than a fully-populated one. A 400 on such a request
-	// classifies routing, and is deliberately NOT a schema conformance verdict.
+	// BodyMinimal records that a request body was sent: an empty,
+	// namespace-correct element, or the populated body of a write that has an
+	// entry in writeBodies. A 400 on an empty one classifies routing, and is
+	// deliberately NOT a schema conformance verdict.
 	BodyMinimal bool `json:"body_minimal,omitempty"`
 
 	// MountedByRouter is the router's own answer to "is this path registered",
@@ -192,6 +200,12 @@ type Target struct {
 	// ordinary Client's attempt at each is recorded as a restricted row. Nil
 	// sends every request with Client and records no restricted rows.
 	ManagerClient *http.Client
+	// ManagedDeviceID is the store id of the EndDevice ManagerClient manages.
+	// A manager acts only on its own device, so each restricted write under
+	// /edev/{id} is sent, as the manager and as the ordinary device alike, to
+	// this device in place of the one the crawl found. Empty leaves the path
+	// as crawled.
+	ManagedDeviceID string
 	// MountedPatterns is the router's own enumeration of the patterns it
 	// registered, as returned by assembly.BuildProtocolRouter. Supplying it
 	// enables the second, independent unrouted discriminator. Empty is
@@ -355,14 +369,36 @@ type link struct {
 	advertisedBy string
 	// typeName is the element's xsi:type, which names the resource a list member is.
 	typeName string
+	// manager is set on a link followed with the manager certificate: the
+	// server shows the usage point list only to a manager, so a device's own
+	// crawl cannot reach what hangs below it.
+	manager bool
+}
+
+// linkRootExceptions names the links whose resource has a different root
+// element than the link name minus "Link", because sep.xsd types the link for
+// a role and the resource for its shape. A later Active list adds its row here.
+var linkRootExceptions = map[string]string{
+	// sep.xsd:4628 types ActiveDERControlListLink; the list it names is a
+	// DERControlList (the WADL resource ActiveDERControlList has no element
+	// of its own).
+	"ActiveDERControlListLink": "DERControlList",
+
+	// The three DER association links name the DER's own route for a resource
+	// whose root element is the target's: the program, the program list and the
+	// usage point themselves.
+	"CurrentDERProgramLink":        "DERProgram",
+	"AssociatedDERProgramListLink": "DERProgramList",
+	"AssociatedUsagePointLink":     "UsagePoint",
 }
 
 // parseLinks extracts every advertised href from a response body.
 //
 // The expected root is the link element name with a trailing "Link" stripped,
 // which is the schema's own naming contract: a DERProgramListLink advertises a
-// DERProgramList. That contract is what lets a body check catch a link that
-// resolves but serves the wrong resource type.
+// DERProgramList, except the links in linkRootExceptions. That contract is
+// what lets a body check catch a link that resolves but serves the wrong
+// resource type.
 func parseLinks(body []byte, sourcePath string) []link {
 	if len(body) == 0 {
 		return nil
@@ -399,6 +435,9 @@ func parseLinks(body []byte, sourcePath string) []link {
 		expected := ""
 		if strings.HasSuffix(name, "Link") {
 			expected = strings.TrimSuffix(name, "Link")
+			if root, ok := linkRootExceptions[name]; ok {
+				expected = root
+			}
 		}
 		out = append(out, link{
 			href:         href,
@@ -671,6 +710,9 @@ type seed struct {
 	// order, against the stores the target serves, and gets the device id the
 	// first seed created. method and path are for the row only.
 	direct func(ctx context.Context, s *server.Stores, dev string) error
+	// manager sends the seed with the manager certificate, for a write the
+	// server restricts to one.
+	manager bool
 }
 
 // seeds create a minimum of real server state before the read phases.
@@ -706,12 +748,53 @@ func seedSet() []seed {
 				`<serviceCategoryKind>0</serviceCategoryKind><status>1</status></MirrorUsagePoint>`,
 		},
 		{
-			method: http.MethodPost, path: "/upt", element: "UsagePoint",
+			method: http.MethodPost, path: "/upt", element: "UsagePoint", manager: true,
 			body: `<UsagePoint xmlns="` + sepNS + `">` +
 				`<mRID>0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FBB</mRID>` +
 				`<description>wadl sweep upt</description><roleFlags>03</roleFlags>` +
 				`<serviceCategoryKind>0</serviceCategoryKind><status>1</status>` +
 				`</UsagePoint>`,
+		},
+		{
+			// A MeterReading with one ReadingSet, one Reading and a ReadingType
+			// under the UsagePoint above, so the crawl can follow the whole
+			// hierarchy. No protocol route creates them.
+			method: http.MethodGet, path: "/upt/{upt}/mr/1", element: "MeterReading",
+			direct: func(ctx context.Context, s *server.Stores, _ string) error {
+				upt := coremetering.UsagePointStoreID("0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FBB")
+				mrHref := coremetering.UsagePointHref(upt) + "/mr/1"
+				setHref := mrHref + "/rs/1"
+				mr := sep2.MeterReading{
+					IdentifiedObject:   sep2.IdentifiedObject{MRID: "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FE1"},
+					ReadingTypeLink:    &sep2.Link{Href: mrHref + "/rt"},
+					ReadingSetListLink: &sep2.ListLink{Href: mrHref + "/rs", All: 1},
+				}
+				mr.Href = mrHref
+				if err := s.MeterReadings.Create(ctx, upt, "1", mr); err != nil {
+					return err
+				}
+				uom := sep2.UomWattHours
+				rt := sep2.ReadingType{Uom: &uom}
+				rt.Href = mrHref + "/rt"
+				if err := s.ReadingTypes.Create(ctx, upt, "1", rt); err != nil {
+					return err
+				}
+				set := sep2.ReadingSet{
+					IdentifiedObject: sep2.IdentifiedObject{MRID: "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FE2"},
+					TimePeriod:       sep2.DateTimeInterval{Start: 1785700000, Duration: 900},
+					ReadingListLink:  &sep2.ListLink{Href: setHref + "/r", All: 1},
+				}
+				set.Href = setHref
+				setScope, _ := coremetering.ReadingSetScopeKey(upt, "1")
+				if err := s.ReadingSets.Create(ctx, setScope, "1", set); err != nil {
+					return err
+				}
+				value, localID := int64(42), sep2.HexBinary16(1)
+				reading := sep2.Reading{Value: &value, LocalID: &localID, TimePeriod: &sep2.DateTimeInterval{Start: 1785700000, Duration: 900}}
+				reading.Href = setHref + "/r/1"
+				readingScope, _ := coremetering.ReadingScopeKey(upt, "1", "1")
+				return s.Readings.Create(ctx, readingScope, "1", reading)
+			},
 		},
 		{
 			method: http.MethodPost, path: "/edev/" + devToken + "/lel", element: "LogEvent",
@@ -753,10 +836,60 @@ func seedSet() []seed {
 			},
 		},
 		{
+			// An FSA, a DERProgram under it and one control in force, so the
+			// crawl can follow FSA -> program -> control lists, including the
+			// program's active list. No protocol route creates any of them.
+			method: http.MethodGet, path: "/edev/" + devToken + "/fsa/1", element: "DERProgram",
+			direct: func(ctx context.Context, s *server.Stores, dev string) error {
+				progHref := coreder.DERProgramHref(dev, "1", "1")
+				fsa := sep2.FunctionSetAssignments{IdentifiedObject: sep2.IdentifiedObject{MRID: "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FD1"}}
+				fsa.Href = "/edev/" + dev + "/fsa/1"
+				fsa.DERProgramListLink = &sep2.ListLink{Href: fsa.Href + "/derp", All: 1}
+				if err := s.FSAs.Create(ctx, dev, "1", fsa); err != nil {
+					return err
+				}
+				prog := fsaprogram.CopyProgram(dev, "1", memory.ProgramTemplate{
+					ID: "1", MRID: "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FD2", Description: "wadl sweep derp", Primacy: 1,
+				})
+				prog.DefaultDERControlLink = &sep2.Link{Href: coreder.DefaultHref(progHref)}
+				if err := s.DERPrograms.Create(ctx, dev, "1", prog); err != nil {
+					return err
+				}
+				now := sep2time.Now().Unix()
+				ctrl := sep2.DERControl{DERControlBase: &sep2.DERControlBase{OpModTargetW: &sep2.ActivePower{Value: 1}}}
+				ctrl.MRID = "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FD3"
+				ctrl.Href = progHref + "/derc/1"
+				ctrl.CreationTime = now - 200
+				ctrl.Interval = &sep2.DateTimeInterval{Start: now - 100, Duration: 3600}
+				if err := s.DERControls.Create(ctx, derhref.ScopeKey(dev, "1", "1"), "1", ctrl); err != nil {
+					return err
+				}
+				// The device's DER records the program as its current one and the
+				// usage point seeded above as its associated one, and a curve is
+				// stored for the program's curve list.
+				ders, err := s.DERs.List(ctx, dev, store.ListOptions{Unbounded: true})
+				if err != nil {
+					return err
+				}
+				uptHref := coremetering.UsagePointHref(coremetering.UsagePointStoreID("0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FBB"))
+				for _, d := range ders.Items {
+					d.CurrentDERProgramLink = &sep2.Link{Href: progHref}
+					d.AssociatedUsagePointLink = &sep2.Link{Href: uptHref}
+					if err := s.DERs.Update(ctx, dev, d.Href[strings.LastIndex(d.Href, "/")+1:], d); err != nil {
+						return err
+					}
+				}
+				curve := sep2.DERCurve{CreationTime: now - 300, CurveType: 0}
+				curve.MRID = "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FD4"
+				curve.Href = "/dc/1"
+				return s.DERCurves.Create(ctx, "1", curve)
+			},
+		},
+		{
 			method: http.MethodGet, path: "/msg/1", element: "MessagingProgram",
 			direct: func(ctx context.Context, s *server.Stores, _ string) error {
 				mp := sep2.MessagingProgram{
-					MRID: "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FCC", Description: "wadl sweep msg", Primacy: 1,
+					IdentifiedObject: sep2.IdentifiedObject{MRID: "0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FCC", Description: "wadl sweep msg"}, Primacy: 1,
 					TextMessageListLink: &sep2.ListLink{Href: "/msg/1/tm"},
 				}
 				mp.Href = "/msg/1"
@@ -764,6 +897,57 @@ func seedSet() []seed {
 			},
 		},
 	}
+}
+
+// writeBodyKey names one write by the WADL resource id and verb.
+type writeBodyKey struct{ resource, verb string }
+
+// writeBodies are the populated request bodies for writes whose empty element a
+// correct server refuses with 400, which the sweep would score wrong_status
+// against a WADL that declares only success. A server-authored resource has
+// required fields (mRID, primacy, an interval), so an empty element is not a
+// probe of the write at all. This is the one place such a body is added; a
+// write with no entry here is sent the empty element.
+// TestDERWriteBodiesAreSchemaValid runs each body through a structural check
+// against sep.xsd (elements, order, maxOccurs; not simple-type values or
+// facets) when a copy is supplied; the full check moves to core's exported
+// validator, GRIDAPPSD/ieee-2030_5-core-go#256.
+var writeBodies = map[writeBodyKey]string{
+	{"DERProgramList", http.MethodPost}: `<DERProgram xmlns="` + sepNS + `">` +
+		`<mRID>0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FF1</mRID><description>wadl sweep derp post</description>` +
+		`<primacy>1</primacy></DERProgram>`,
+	{"AssociatedDERProgramList", http.MethodPost}: `<DERProgram xmlns="` + sepNS + `">` +
+		`<mRID>0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FF2</mRID><description>wadl sweep associated derp</description>` +
+		`<primacy>1</primacy></DERProgram>`,
+	{"DERControlList", http.MethodPost}: `<DERControl xmlns="` + sepNS + `">` +
+		`<mRID>0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FF3</mRID><creationTime>1785700000</creationTime>` +
+		`<EventStatus><currentStatus>0</currentStatus><dateTime>1785700000</dateTime>` +
+		`<potentiallySuperseded>false</potentiallySuperseded></EventStatus>` +
+		`<interval><duration>3600</duration><start>1785700100</start></interval>` +
+		`<DERControlBase><opModTargetW><multiplier>0</multiplier><value>50</value></opModTargetW></DERControlBase>` +
+		`</DERControl>`,
+	{"DefaultDERControl", http.MethodPut}: `<DefaultDERControl xmlns="` + sepNS + `">` +
+		`<mRID>0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FF4</mRID>` +
+		`<DERControlBase><opModTargetW><multiplier>0</multiplier><value>50</value></opModTargetW></DERControlBase>` +
+		`</DefaultDERControl>`,
+	{"DERCurveList", http.MethodPost}: `<DERCurve xmlns="` + sepNS + `">` +
+		`<mRID>0F0F0F0F0F0F0F0F0F0F0F0F0F0F0FF5</mRID><creationTime>1785700000</creationTime>` +
+		`<CurveData><xvalue>0</xvalue><yvalue>0</yvalue></CurveData>` +
+		`<curveType>0</curveType><xMultiplier>0</xMultiplier><yMultiplier>0</yMultiplier>` +
+		`<yRefType>1</yRefType></DERCurve>`,
+}
+
+// requestBody is the body a mutating method is sent: its writeBodies entry, or
+// the empty element of the type its request names, or none for a method with
+// no request body.
+func requestBody(meth Method) []byte {
+	if (meth.Verb != http.MethodPut && meth.Verb != http.MethodPost) || len(meth.RequestElements) == 0 {
+		return nil
+	}
+	if b, ok := writeBodies[writeBodyKey{meth.ResourceID, meth.Verb}]; ok {
+		return []byte(b)
+	}
+	return []byte(`<` + meth.RequestElements[0] + ` xmlns="` + sepNS + `"/>`)
 }
 
 // phaseSeed returns the hrefs the seeds minted, for resources no advertised
@@ -796,7 +980,11 @@ func (t *Target) phaseSeed(rows *[]Row, ri *routeIndex) []string {
 				r.status = http.StatusOK
 			}
 		default:
-			r = t.do(s.method, path, []byte(body))
+			client := t.Client
+			if s.manager && t.ManagerClient != nil {
+				client = t.ManagerClient
+			}
+			r = t.doWith(client, s.method, path, []byte(body))
 		}
 
 		v := Verdict(fmt.Sprintf("%s_%d", VerdictSeedFailed, r.status))
@@ -840,21 +1028,38 @@ const maxDiscoveryURLs = 600
 // crawlRoot is the advertisedBy of the first link, which no resource advertises.
 const crawlRoot = "(root)"
 
+// managerCrawlRoot is the advertisedBy of the second crawl start, which only the
+// manager certificate can follow.
+const managerCrawlRoot = "(manager root)"
+
+// managerCrawlPrefix bounds the manager crawl: its links are followed as the
+// manager only while they stay under it.
+const managerCrawlPrefix = "/upt"
+
 func (t *Target) phaseDiscovery(rows *[]Row, ri *routeIndex, bodies map[string][]byte) ([]string, *crawl) {
 	seen := map[string]bool{}
 	queue := []link{{href: "/dcap", expectedRoot: "DeviceCapability", advertisedBy: crawlRoot}}
+	if t.ManagerClient != nil {
+		queue = append(queue, link{href: managerCrawlPrefix, expectedRoot: "UsagePointList", advertisedBy: managerCrawlRoot, manager: true})
+	}
 	var discovered []string
 	reached := newCrawl()
 
 	for len(queue) > 0 && len(seen) < maxDiscoveryURLs {
 		l := queue[0]
 		queue = queue[1:]
-		if seen[l.href] {
+		seenKey := l.href
+		client := t.Client
+		if l.manager {
+			seenKey += " (manager)"
+			client = t.ManagerClient
+		}
+		if seen[seenKey] {
 			continue
 		}
-		seen[l.href] = true
+		seen[seenKey] = true
 
-		r := t.do(http.MethodGet, l.href, nil)
+		r := t.doWith(client, http.MethodGet, l.href, nil)
 		root := rootElement(r.body)
 
 		v := VerdictConformant
@@ -896,7 +1101,12 @@ func (t *Target) phaseDiscovery(rows *[]Row, ri *routeIndex, bodies map[string][
 			reached.add(l.resourceID(), l.href)
 			reached.add(rootTypeName(r.body), l.href)
 			for _, nxt := range parseLinks(r.body, l.href) {
-				if !seen[nxt.href] && strings.HasPrefix(nxt.href, "/") {
+				nxt.manager = l.manager && strings.HasPrefix(nxt.href, managerCrawlPrefix)
+				key := nxt.href
+				if nxt.manager {
+					key += " (manager)"
+				}
+				if !seen[key] && strings.HasPrefix(nxt.href, "/") {
 					queue = append(queue, nxt)
 				}
 			}
@@ -963,14 +1173,12 @@ func (t *Target) phaseWADL(m *Model, discovered []string, reached *crawl, rows *
 			}
 		}
 
-		var body []byte
-		if (meth.Verb == http.MethodPut || meth.Verb == http.MethodPost) && len(meth.RequestElements) > 0 {
-			body = []byte(`<` + meth.RequestElements[0] + ` xmlns="` + sepNS + `"/>`)
-		}
+		body := requestBody(meth)
 
 		client := t.Client
 		asManager := false
 		if t.ManagerClient != nil && restrictedWrite(meth) {
+			path = t.pairedPath(path)
 			// The device goes first: a manager DELETE that succeeded would
 			// leave the device a 404 that says nothing about authority.
 			t.probeDeviceOnRestricted(rows, meth, path, body)
@@ -1131,19 +1339,31 @@ func (r *Results) CountMode(mode Mode, v Verdict) int {
 // resource the crawl did not reach. Those methods are not probed, so no
 // per-method row carries them.
 func (r *Results) NotReachedMethods(m *Model, mode Mode) int {
+	return len(r.notReachedMethodList(m, mode))
+}
+
+// notReachedMethodList is the one home of the not-reached selection: the model's
+// methods of one mode whose resource the crawl missed, in model order.
+func (r *Results) notReachedMethodList(m *Model, mode Mode) []Method {
 	missed := map[resKey]bool{}
-	for _, row := range r.Rows {
-		if row.Phase == PhaseWADL && row.Verdict == VerdictNotReached {
-			missed[resKey{row.ResourceID, row.WADLPath}] = true
-		}
+	for _, row := range r.NotReachedRows() {
+		missed[resKey{row.ResourceID, row.WADLPath}] = true
 	}
-	n := 0
+	var out []Method
 	for _, meth := range m.Methods {
 		if meth.Mode == mode && missed[keyOf(meth)] {
-			n++
+			out = append(out, meth)
 		}
 	}
-	return n
+	return out
+}
+
+// NotReachedRows is the one home of the not_reached row selection: the WADL-phase
+// rows of resources the crawl missed.
+func (r *Results) NotReachedRows() []Row {
+	return r.Filter(func(row Row) bool {
+		return row.Phase == PhaseWADL && row.Verdict == VerdictNotReached
+	})
 }
 
 // Filter returns every row matching a predicate.
@@ -1208,4 +1428,17 @@ func (r *Results) Summary() []string {
 		out = append(out, fmt.Sprintf("%-10s %-34s %d", k.p, k.v, counts[k]))
 	}
 	return out
+}
+
+// edevSegment matches the leading /edev/{id} of a path.
+var edevSegment = regexp.MustCompile(`^/edev/[^/]+`)
+
+// pairedPath points a path under /edev/{id} at the manager's own device, so the
+// manager's write and the ordinary device's probe of it name the same record
+// and the manager is not refused for acting on a device it does not manage.
+func (t *Target) pairedPath(path string) string {
+	if t.ManagedDeviceID == "" {
+		return path
+	}
+	return edevSegment.ReplaceAllLiteralString(path, "/edev/"+t.ManagedDeviceID)
 }

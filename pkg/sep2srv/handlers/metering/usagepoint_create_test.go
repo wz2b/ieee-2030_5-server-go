@@ -39,7 +39,7 @@ const usagePointHrefLen = 37
 
 func postUsagePoint(t *testing.T, mux *http.ServeMux, mrid string) *httptest.ResponseRecorder {
 	t.Helper()
-	body, err := xml.Marshal(&sep2.UsagePoint{MRID: mrid})
+	body, err := xml.Marshal(&sep2.UsagePoint{IdentifiedObject: sep2.IdentifiedObject{MRID: mrid}})
 	if err != nil {
 		t.Fatalf("marshal UsagePoint: %v", err)
 	}
@@ -319,7 +319,7 @@ func TestUsagePointItemMethodsNotMounted(t *testing.T) {
 	s := memory.NewStore[sep2.UsagePoint]()
 	if err := s.Create(context.Background(), "upt1", sep2.UsagePoint{
 		SubscribableResource: sep2.SubscribableResource{Resource: sep2.Resource{Href: "/upt/upt1"}},
-		MRID:                 "ORIGINAL",
+		IdentifiedObject:     sep2.IdentifiedObject{MRID: "ORIGINAL"},
 	}); err != nil {
 		t.Fatalf("seed UsagePoint: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestUsagePointItemMethodsNotMounted(t *testing.T) {
 	bare := http.NewServeMux()
 	bare.HandleFunc("/upt/{uptId}", metering.HandleUsagePoint(s))
 
-	body, err := xml.Marshal(&sep2.UsagePoint{MRID: "OVERWRITTEN"})
+	body, err := xml.Marshal(&sep2.UsagePoint{IdentifiedObject: sep2.IdentifiedObject{MRID: "OVERWRITTEN"}})
 	if err != nil {
 		t.Fatalf("marshal UsagePoint: %v", err)
 	}
@@ -372,4 +372,19 @@ func TestHandleCreateUsagePoint_ParallelAnonymousPostsGetDistinctIDs(t *testing.
 	idminttest.AssertParallelCreatesDistinct(t, mux, 16, func() *http.Request {
 		return httptest.NewRequest(http.MethodPost, "/upt", bytes.NewReader(body))
 	})
+}
+
+// A cap of zero or below would answer every POST /upt with a 507 that reads as
+// a full store, so wiring one must fail at construction.
+func TestHandleCreateUsagePointRefusesANonPositiveCap(t *testing.T) {
+	for _, n := range []int{0, -1} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("WithMaxUsagePoints(%d) did not panic at construction", n)
+				}
+			}()
+			metering.HandleCreateUsagePoint(memory.NewStore[sep2.UsagePoint](), metering.WithMaxUsagePoints(n))
+		}()
+	}
 }

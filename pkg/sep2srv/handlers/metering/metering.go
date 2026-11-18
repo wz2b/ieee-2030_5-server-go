@@ -1,18 +1,24 @@
 package metering
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2/encoding"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/logsafe"
+	coreedev "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/enddevice"
+	corelisthandler "github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/listhandler"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/idmint"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/srverr"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
@@ -158,8 +164,21 @@ func UsagePointStoreID(clientMRID string) string {
 // on 201, and the Location header on the ErrAlreadyExists branch cannot drift
 // into three different strings for one resource.
 func UsagePointHref(id string) string {
-	return "/upt/" + id
+	return usagePointHrefPrefix + id
 }
+
+// UsagePointIDFromHref is the inverse of [UsagePointHref]: the store id a
+// UsagePoint href names, and false for any other shape, including an empty id
+// or one that nests a path.
+func UsagePointIDFromHref(href string) (string, bool) {
+	id, ok := strings.CutPrefix(href, usagePointHrefPrefix)
+	if !ok || id == "" || strings.Contains(id, "/") {
+		return "", false
+	}
+	return id, true
+}
+
+const usagePointHrefPrefix = "/upt/"
 
 // HandleCreateUsagePoint returns a handler for POST /upt.
 //
@@ -177,7 +196,24 @@ func UsagePointHref(id string) string {
 // satisfies it, so every existing call site is unchanged; what it buys is that
 // the ErrAlreadyExists-then-Get-fails path can be driven in a test at all, and
 // that path is precisely the one whose swallowed error this change fixes.
-func HandleCreateUsagePoint(uptStore store.ResourceStore[sep2.UsagePoint]) http.HandlerFunc {
+//
+// It takes no authority decision: it is mounted only behind the manager-only
+// check. The number of UsagePoints is capped (DefaultMaxUsagePoints unless
+// WithMaxUsagePoints says otherwise), because the records are global and held
+// in memory.
+func HandleCreateUsagePoint(uptStore store.ResourceStore[sep2.UsagePoint], opts ...UsagePointOption) http.HandlerFunc {
+	maxPoints := DefaultMaxUsagePoints
+	for _, opt := range opts {
+		opt(&maxPoints)
+	}
+	// A cap of zero or below would refuse every POST /upt with a 507 that
+	// looks like a full store, so a bad option fails at wiring time.
+	if maxPoints <= 0 {
+		panic(fmt.Sprintf("metering: UsagePoint cap must be positive, got %d", maxPoints))
+	}
+	// Holds the count check and the Create together, so concurrent POSTs
+	// cannot each pass the check and overshoot the cap.
+	var createMu sync.Mutex
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			encoding.MethodNotAllowed(w, "POST")
@@ -212,7 +248,19 @@ func HandleCreateUsagePoint(uptStore store.ResourceStore[sep2.UsagePoint]) http.
 		upt.Href = UsagePointHref(id)
 		upt.MeterReadingListLink = &sep2.ListLink{Href: upt.Href + "/mr"}
 
-		if err := uptStore.Create(r.Context(), id, upt); err != nil {
+		createMu.Lock()
+		createErr := usagePointRoom(r.Context(), uptStore, id, maxPoints)
+		if createErr == nil {
+			createErr = uptStore.Create(r.Context(), id, upt)
+		}
+		createMu.Unlock()
+		if errors.Is(createErr, errUsagePointCap) {
+			log.Printf("usage point cap of %d reached, refusing %s", maxPoints, logsafe.Str(srverr.Route(r)))
+			http.Error(w, errUsagePointCap.Error(), http.StatusInsufficientStorage)
+			return
+		}
+
+		if err := createErr; err != nil {
 			if errors.Is(err, store.ErrAlreadyExists) {
 				// The record was deleted between the Create above and this
 				// Get, or the store failed. Either way there is no existing
@@ -244,15 +292,97 @@ func HandleCreateUsagePoint(uptStore store.ResourceStore[sep2.UsagePoint]) http.
 	}
 }
 
-// HandleReadingType returns a handler for GET /rt/{id}.
-func HandleReadingType(rtStore store.ResourceStore[sep2.ReadingType]) http.HandlerFunc {
+// DefaultMaxUsagePoints bounds the UsagePoints POST /upt will create.
+const DefaultMaxUsagePoints = 1000
+
+// UsagePointOption configures HandleCreateUsagePoint.
+type UsagePointOption func(maxPoints *int)
+
+// WithMaxUsagePoints replaces the default cap on created UsagePoints.
+func WithMaxUsagePoints(n int) UsagePointOption {
+	return func(maxPoints *int) { *maxPoints = n }
+}
+
+// errUsagePointCap is usagePointRoom's answer when the cap is reached.
+var errUsagePointCap = errors.New("usage point limit reached")
+
+// usagePointRoom reports nil when a UsagePoint may be created under id. At the
+// cap a POST naming an existing record still goes through, since it adds
+// nothing.
+func usagePointRoom(ctx context.Context, uptStore store.ResourceStore[sep2.UsagePoint], id string, maxPoints int) error {
+	n, err := uptStore.Count(ctx)
+	if err != nil {
+		return fmt.Errorf("count the UsagePoints: %w", err)
+	}
+	if int(n) < maxPoints {
+		return nil
+	}
+	_, err = uptStore.Get(ctx, id)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrNotFound):
+		return errUsagePointCap
+	}
+	return fmt.Errorf("look up the UsagePoint at the cap: %w", err)
+}
+
+// HandleUsagePointList returns the handler for GET /upt. UsagePoints are
+// server-authored and have no owner, so only a manager (coreedev.IsManager)
+// sees them; any other caller gets a well-formed empty list. The operator
+// reads the store directly and is not affected.
+func HandleUsagePointList(s store.ResourceStore[sep2.UsagePoint], managers store.EndDeviceManagementReader, lfdiProvider LFDIProvider, pollRate uint32) http.HandlerFunc {
+	managersAbsent := store.IsAbsent(managers)
+	full := corelisthandler.ListHandler[sep2.UsagePoint, sep2.UsagePointList](s, BuildUsagePointList, pollRate)
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			encoding.MethodNotAllowed(w, "GET, HEAD")
 			return
 		}
-		id := r.PathValue("id")
-		rt, err := rtStore.Get(r.Context(), id)
+		lfdi, ok := lfdiProvider.require(w, r)
+		if !ok {
+			return
+		}
+		manager := false
+		if !managersAbsent {
+			var err error
+			if manager, err = coreedev.IsManager(r.Context(), managers, lfdi); err != nil {
+				srverr.Internal(w, r, err)
+				return
+			}
+		}
+		if manager {
+			full.ServeHTTP(w, r)
+			return
+		}
+		empty := BuildUsagePointList(r.URL.Path, store.ListResult[sep2.UsagePoint]{}, pollRate)
+		encoding.WriteXML(w, http.StatusOK, &empty)
+	}
+}
+
+// HandleReadingType returns a handler for GET /rt/{id}.
+func HandleReadingType(rtStore store.ResourceReader[sep2.ReadingType]) http.HandlerFunc {
+	return handleReadingTypeAt(func(r *http.Request) (sep2.ReadingType, error) {
+		return rtStore.Get(r.Context(), r.PathValue("id"))
+	})
+}
+
+// HandleMeterReadingType returns a handler for GET /upt/{uptId}/mr/{mrId}/rt,
+// the ReadingType a MeterReading carries. The record is kept under the
+// UsagePoint, keyed by the MeterReading id, so it is reachable only there.
+func HandleMeterReadingType(rtStore store.ScopedReader[sep2.ReadingType]) http.HandlerFunc {
+	return handleReadingTypeAt(func(r *http.Request) (sep2.ReadingType, error) {
+		return rtStore.Get(r.Context(), r.PathValue("uptId"), r.PathValue("mrId"))
+	})
+}
+
+func handleReadingTypeAt(get func(r *http.Request) (sep2.ReadingType, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			encoding.MethodNotAllowed(w, "GET, HEAD")
+			return
+		}
+		rt, err := get(r)
 		if err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				http.Error(w, "not found", http.StatusNotFound)
@@ -262,6 +392,46 @@ func HandleReadingType(rtStore store.ResourceStore[sep2.ReadingType]) http.Handl
 			return
 		}
 		encoding.WriteXML(w, http.StatusOK, &rt)
+	}
+}
+
+// ScopeKey joins path values into a composite store parent key. ok is false
+// when a value is empty or contains "/": the mux decodes %2F into a path value,
+// so a value holding the separator could otherwise forge another record's key.
+// It is the only place the join is written.
+func ScopeKey(parts ...string) (key string, ok bool) {
+	for _, p := range parts {
+		if p == "" || strings.Contains(p, "/") {
+			return "", false
+		}
+	}
+	return strings.Join(parts, "/"), true
+}
+
+// ReadingSetScopeKey is the parent key the ReadingSets, and the Readings
+// listed directly under a MeterReading, are stored under.
+func ReadingSetScopeKey(uptID, mrID string) (string, bool) {
+	return ScopeKey(uptID, mrID)
+}
+
+// ReadingScopeKey is the parent key the Readings of one ReadingSet are stored
+// under.
+func ReadingScopeKey(uptID, mrID, rsID string) (string, bool) {
+	return ScopeKey(uptID, mrID, rsID)
+}
+
+// BuildReadingSetList constructs a ReadingSetList.
+func BuildReadingSetList(href string, result store.ListResult[sep2.ReadingSet], pollRate uint32) sep2.ReadingSetList {
+	return sep2.ReadingSetList{
+		ListResource: sep2.ListResource{
+			SubscribableResource: sep2.SubscribableResource{
+				Resource: sep2.Resource{Href: href},
+			},
+			All:      result.All,
+			Results:  result.Results,
+			PollRate: pollRate,
+		},
+		ReadingSet: result.Items,
 	}
 }
 

@@ -2,6 +2,7 @@ package der
 
 import (
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/activelist"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/dercontrol"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/derhref"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
@@ -43,3 +44,11 @@ func NewDerivedStatusControlStoreFor(controls store.ScopedStore[sep2.DERControl]
 }
 
 var _ store.ScopedStore[sep2.DERControl] = (*DerivedStatusControlStore)(nil)
+
+// NewActiveControlStore serves only the controls of controls that are Active
+// at request time, with the paging and order the caller layers on top (see
+// [activelist.ActiveStore]). controls should be the status-deriving store, so
+// cancel and supersede count.
+func NewActiveControlStore(controls store.ScopedStore[sep2.DERControl]) store.ScopedStore[sep2.DERControl] {
+	return activelist.NewActiveStore(controls, func(c *sep2.DERControl) *sep2.Event { return &c.Event })
+}

@@ -180,10 +180,12 @@ func MintableHrefs() []MintableHref {
 		{"/edev", http.MethodGet, "handlers/dcap.HandleDeviceCapability EndDeviceListLink", "clients enumerate and register EndDevices here"},
 		{"/mup", http.MethodGet, "handlers/dcap.HandleDeviceCapability MirrorUsagePointListLink", "metering clients POST mirrors here"},
 		{"/upt", http.MethodGet, "handlers/dcap.HandleDeviceCapability UsagePointListLink", "server-side metering"},
-		{"/dc", http.MethodGet, "handlers/dcap.HandleDeviceCapability DERProgramListLink", "global DERCurve list"},
+		{"/dc", http.MethodGet, "routefamily.All", "global DERCurve list, not linked from /dcap"},
+		{"/dc/{}", http.MethodGet, "assembly.curveHandler", "the curve href a DERControl's curve link carries, and the member href of the global curve list"},
 		{"/msg", http.MethodGet, "handlers/dcap.HandleDeviceCapability MessagingProgramListLink", "messaging programs"},
 		{"/rsps", http.MethodGet, "handlers/dcap.HandleDeviceCapability ResponseSetListLink", "response sets"},
 		{"/rt", http.MethodGet, "routefamily.All", "ReadingType list, mounted on the top-level mux"},
+		{"/ntfy", http.MethodPost, "handlers/notification.HandlePost", "where a device delivers a Notification; no resource links to it"},
 
 		// EndDevice and its immediate children.
 		{"/edev/{}", http.MethodGet, "handlers/enddevice.HandleCreateEndDevice", "the Location header a client follows after POST /edev, and the self href of every EndDevice in the list"},
@@ -227,18 +229,27 @@ func MintableHrefs() []MintableHref {
 		{"/edev/{}/der/{}/derg", http.MethodGet, "handlers/der.DERSingletonHandlers", "DERSettings self href"},
 		{"/edev/{}/der/{}/ders", http.MethodGet, "handlers/der.DERSingletonHandlers", "DERStatus self href"},
 		{"/edev/{}/der/{}/dera", http.MethodGet, "handlers/der.DERSingletonHandlers", "DERAvailability self href"},
+		{"/edev/{}/der/{}/derp", http.MethodGet, "handlers/der.FillAbsentDERLinks AssociatedDERProgramListLink", "the programs stored under the DER's device"},
+		{"/edev/{}/der/{}/cdp", http.MethodGet, "handlers/der.FillAbsentDERLinks CurrentDERProgramLink", "the program a stored DER names as its current one, advertised only on a DER that stores the link"},
+		{"/edev/{}/der/{}/upt", http.MethodGet, "handlers/der.FillAbsentDERLinks AssociatedUsagePointLink", "the UsagePoint a stored DER names, advertised only on a DER that stores the link and only where UsagePoints are served"},
+		{"/edev/{}/fsa/{}/derp/{}/dc", http.MethodGet, "handlers/der.DERControlCountedProgramStore DERCurveListLink", "the curve catalog under a program"},
+		{"/edev/{}/fsa/{}/derp/{}/dc/{}", http.MethodGet, "assembly.programCurveListBuilder", "a curve's program-scoped href, the member href of the program's curve list"},
 		{"/edev/{}/fsa/{}/derp/{}/dderc", http.MethodGet, "handlers/der.DefaultDERControlHandler", "DefaultDERControl self href"},
 
 		// Resources created by a client POST. Every one of these is handed
 		// back in a Location header, which is the strongest form of the
 		// advertisement: the server is telling the client where the thing it
 		// just created now lives.
-		{"/edev/{}/sub/{}", http.MethodGet, "handlers/subscription.HandleCreateSubscription", "the Location header returned by POST /edev/{}/sub; a client re-reads its subscription to confirm what the server stored"},
+		{"/edev/{}/sub/{}", http.MethodGet, "handlers/subscription.HandleSubscription", "the Location header returned by POST /edev/{}/sub; a client re-reads its subscription to confirm what the server stored"},
 		{"/edev/{}/sub/{}", http.MethodDelete, "handlers/subscription.HandleCreateSubscription", "the same Location header, used to cancel the subscription"},
 		{"/edev/{}/lel/{}", http.MethodGet, "handlers/logevent.HandlePostLogEvent", "the Location header returned by POST /edev/{}/lel"},
+		{"/edev/{}/lel/{}", http.MethodPut, "handlers/logevent.HandlePostLogEvent", "the same Location header, used to replace the event; PUT on the LogEvent is mode O (sep_wadl.xml:1404)"},
 		{"/edev/{}/lel/{}", http.MethodDelete, "handlers/logevent.HandlePostLogEvent", "the same Location header, used to remove the event; DELETE on the LogEvent is Mandatory (sep_wadl.xml:1430)"},
 		{"/edev/{}/frq/{}", http.MethodGet, "handlers/flow_reservation.HandlePostFlowReservationRequest", "the Location header returned by POST /edev/{}/frq"},
+		{"/edev/{}/frq/{}", http.MethodDelete, "handlers/flow_reservation.HandlePostFlowReservationRequest", "the same Location header, used to remove an ended request; DELETE on the FlowReservationRequest is mode O (sep_wadl.xml:3977)"},
 		{"/edev/{}/frp/{}", http.MethodGet, "handlers/flow_reservation.HandlePostFlowReservationRequest", "the FlowReservationResponse href stamped alongside the request, which the client polls for the server's decision"},
+		{"/msg/{}", http.MethodGet, "handlers/messaging.ActiveLinkProgramStore", "the MessagingProgram self href the active link is derived from"},
+		{"/msg/{}/acttm", http.MethodGet, "handlers/messaging.ActiveLinkProgramStore ActiveTextMessageListLink", "the program's active text message list, advertised on every MessagingProgram"},
 		{"/msg/{}/tm/{}", http.MethodGet, "handlers/messaging.HandlePostTextMessage", "the Location header returned by POST /msg/{}/tm"},
 		{"/rsps/{}/rsp/{}", http.MethodGet, "handlers/response.MemberHref", "the Location header returned by POST /rsps/{}/rsp, and the Response's own self href"},
 
@@ -279,10 +290,10 @@ func MintableHrefs() []MintableHref {
 // Removing an entry is the fix landing. TestKnownUnroutedHrefs_RatchetIsExact
 // fails if an entry here starts routing, so the set cannot quietly stop
 // shrinking, and it fails if a shape stops routing without being added here.
-// Mounting their routes removed three entries: GET /edev/{}/frq/{}, GET
-// /edev/{}/frp/{} and GET /msg/{}/tm/{}.
+// Mounting their routes removed four entries: GET /edev/{}/frq/{}, GET
+// /edev/{}/frp/{}, GET /msg/{}/tm/{} and GET /mup/{}/mr/{}.
 //
-// A fourth removal, GET /edev/{}/log/{}, is worth being precise about,
+// A fifth removal, GET /edev/{}/log/{}, is worth being precise about,
 // because an entry can leave this set for two very different reasons and
 // only one of them is a fix. It did NOT leave because its mint site vanished
 // and took the shape with it: the resource the Location named is now
@@ -290,18 +301,13 @@ func MintableHrefs() []MintableHref {
 // (sep_wadl.xml:1404) and which the registry above now carries for both GET
 // and DELETE. The old shape is gone from the registry only because the POST
 // handler stamps the declared address instead of the undeclared one; the
-// reachability the entry recorded as missing is present. The two entries
-// that remain still need real fixes, and core has no public issue
-// tracker to anchor a per-entry owner tag to. What keeps this set a
-// ratchet rather than a bare suppression is not an owner tag but the
-// non-empty, specific reason every entry carries:
+// reachability the entry recorded as missing is present. The set is now
+// empty. What keeps it a ratchet rather than a bare suppression for any
+// future entry is the non-empty, specific reason every entry carries:
 // TestKnownUnroutedHrefs_EntriesAreDeclaredAndReasoned in hrefs_test.go
 // rejects an empty one, and a real reason names the defect precisely
 // enough that a reader can tell the entry apart from a shrug.
-var knownUnroutedHrefs = map[string]string{
-	"GET /edev/{}/sub/{}": "POST /edev/{id}/sub returns this Location but only DELETE is routed, so a client re-reading its own subscription gets 405. The path IS mounted, so this is a method gap rather than a dead link",
-	"GET /mup/{}/mr/{}":   "POST /mup/{id}/mr and POST /mup/{id} both return this Location and nothing serves it",
-}
+var knownUnroutedHrefs = map[string]string{}
 
 // KnownUnroutedHrefs returns a copy of the ratchet set: the mintable hrefs that
 // are known not to resolve and that [AssertMintableHrefs] tolerates, keyed

@@ -41,7 +41,9 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/handlers/notification"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/identity"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/reqlimit"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/routefamily"
 	"io"
 	"log"
@@ -117,7 +119,7 @@ import (
 // # THE GATE IS PER FAMILY, NOT PER FIELD
 //
 // The paragraph above says "every gate", and there are thirteen of them. Each
-// reads ONE ANCHOR field and mounts a whole family behind it; fifteen handles
+// reads ONE ANCHOR field and mounts a whole family behind it; sixteen handles
 // have no gate of their own and are mounted on the strength of a sibling:
 //
 //	anchor                    family members it also mounts
@@ -128,7 +130,7 @@ import (
 //	DERs                      DERCapabilities, DERSettings, DERStatuses,
 //	                          DERAvailabilities, DERPrograms, DERControls,
 //	                          DefaultDERControls, DERCurves
-//	UsagePoints               MeterReadings, Readings, ReadingTypes
+//	UsagePoints               MeterReadings, ReadingSets, Readings, ReadingTypes
 //	Configurations            (its own routes only)
 //	DeviceStatuses            (its own routes only)
 //	LogEvents                 (its own routes only)
@@ -252,8 +254,9 @@ type Stores struct {
 	// Server-side metering
 	UsagePoints   store.ResourceStore[sep2.UsagePoint]
 	MeterReadings store.ScopedStore[sep2.MeterReading]
+	ReadingSets   store.ScopedStore[sep2.ReadingSet]
 	Readings      store.ScopedStore[sep2.Reading]
-	ReadingTypes  store.ResourceStore[sep2.ReadingType]
+	ReadingTypes  store.ScopedStore[sep2.ReadingType]
 
 	// New function sets
 	Configurations           store.ScopedStore[sep2.Configuration]
@@ -273,6 +276,11 @@ type Stores struct {
 	// response list derive EventStatus from it; when absent every response
 	// is served as stored.
 	FlowReservationResponseLifecycles store.ScopedStore[dercontrol.LifecycleRecord]
+
+	// FlowReservationAnswers holds who answered and who cancelled each
+	// response, keyed as the response. Optional: a DELETE of a request
+	// removes an answer record only when this is set.
+	FlowReservationAnswers store.ScopedStore[flowreservation.AnswerRecord]
 
 	// CommitmentLedger is the process's one commitment ledger (#714),
 	// built over the same stores. The flow reservation queue checks every
@@ -460,7 +468,7 @@ func BuildProtocolRouter(
 	top := http.NewServeMux()
 
 	protocolMux := newRecordingMux()
-	protocolMux.HandleFunc("GET /dcap", coredcap.HandleDeviceCapability())
+	protocolMux.HandleFunc("GET /dcap", coredcap.HandleDeviceCapability(wiredAnchors(stores), endDeviceCounter(stores, authPolicy.Identity)))
 	protocolMux.HandleFunc("GET /tm", coresep2time.HandleTime(coresep2time.TimeParams{
 		TZOffset:    cfg.TZOffset,
 		DSTOffset:   cfg.DSTOffset,
@@ -520,9 +528,23 @@ func registerGatedRoutes(next routeRegistrar, cfg RouterConfig, stores *Stores, 
 	})
 	registerMirrorRoutes(gated, stores, authPolicy, cfg.PostRateProvider)
 	registerDERRoutes(gated, stores)
-	registerMeteringRoutes(gated, stores)
+	registerMeteringRoutes(gated, stores, authPolicy)
 	registerNewFunctionSetRoutes(gated, stores, cfg.PEN, cfg.FlowReservationDeadline, cfg.FlowReservationPendingPollRate, authPolicy.Identity, cfg.DeviceLog, deviceLogResolver, notifier)
+	registerNotificationRoute(next, cfg, stores, authPolicy.Identity)
 	return gated
+}
+
+// registerNotificationRoute mounts POST /ntfy. It is mounted whether or not
+// the device log is on, so GET and HEAD answer 405 either way; with the log
+// off the handler refuses a POST with 503 instead of dropping it.
+func registerNotificationRoute(mux routeRegistrar, cfg RouterConfig, stores *Stores, identity identity.Func) {
+	var rec notification.Recorder
+	lookups := newDeviceLogLookups(stores)
+	// A typed nil must not reach the interface: it would read as a recorder.
+	if r := devicelog.NewNotificationRecorder(cfg.DeviceLog, identity, lookups.registered); r != nil {
+		rec = r
+	}
+	mux.HandleFunc("POST "+notification.Href, notification.HandlePost(rec))
 }
 
 // discardRegistrar takes route registrations and serves none of them.
@@ -649,6 +671,82 @@ func asNotificationURIValidator(n ResourceNotifier) func(context.Context, string
 	return nil
 }
 
+// servedFamily names a function set whose mount and advertised links must
+// agree.
+type servedFamily int
+
+const (
+	famMirrorUsagePoints servedFamily = iota
+	famUsagePoints
+	famMessagingPrograms
+	famResponseSets
+	famDERs
+	famConfiguration
+	famDeviceStatus
+	famPowerStatus
+)
+
+// serves is the one decision whether a family is mounted. The route
+// registrars, the /dcap anchors and the EndDevice link decorators all ask it,
+// so a link can never name a route the server did not mount.
+func (s *Stores) serves(f servedFamily) bool {
+	if s == nil {
+		return false
+	}
+	switch f {
+	case famMirrorUsagePoints:
+		return !store.IsAbsent(s.MirrorUsagePoints)
+	case famUsagePoints:
+		return !store.IsAbsent(s.UsagePoints)
+	case famMessagingPrograms:
+		return !store.IsAbsent(s.MessagingPrograms)
+	case famResponseSets:
+		return !store.IsAbsent(s.ResponseSets)
+	case famDERs:
+		return !store.IsAbsent(s.DERs)
+	case famConfiguration:
+		return !store.IsAbsent(s.Configurations)
+	case famDeviceStatus:
+		return !store.IsAbsent(s.DeviceStatuses)
+	case famPowerStatus:
+		return !store.IsAbsent(s.PowerStatuses)
+	}
+	return false
+}
+
+// wiredAnchors says which anchored route families stores serves, from the
+// [Stores.serves], the test each family's mount gate makes. It is the one
+// place an anchor name meets a family.
+func wiredAnchors(stores *Stores) routefamily.Wired {
+	if stores == nil {
+		return nil
+	}
+	return func(a routefamily.Anchor) bool {
+		switch a {
+		case routefamily.AnchorMirrorUsagePoints:
+			return stores.serves(famMirrorUsagePoints)
+		case routefamily.AnchorUsagePoints:
+			return stores.serves(famUsagePoints)
+		case routefamily.AnchorMessagingPrograms:
+			return stores.serves(famMessagingPrograms)
+		case routefamily.AnchorResponseSets:
+			return stores.serves(famResponseSets)
+		case routefamily.AnchorDERs:
+			return stores.serves(famDERs)
+		}
+		return false
+	}
+}
+
+// endDeviceCounter counts the EndDevices GET /edev lists for the caller, or
+// is nil when there are no stores to count from.
+func endDeviceCounter(stores *Stores, identity identity.Func) coredcap.CallerEndDevices {
+	if stores == nil {
+		return nil
+	}
+	return coreedev.CallerEndDeviceCount(stores.EndDevices, stores.EndDeviceManagers, identity)
+}
+
 // registrationBoundEndDevices returns the EndDevice store the /edev routes
 // must use: one that writes an EndDevice and its Registration as a single
 // act and serves a RegistrationLink only when the record behind it exists.
@@ -703,7 +801,7 @@ func logEventLinkedEndDevices(devs store.EndDeviceStore, stores *Stores) store.E
 // exactly when Stores.DERs is non-nil, the condition registerDERRoutes uses to
 // mount GET /edev/{id}/der and the instance routes beneath it.
 func derLinkedEndDevices(devs store.EndDeviceStore, stores *Stores) store.EndDeviceStore {
-	return linkedEndDevices(devs, !store.IsAbsent(stores.DERs), func(devs store.EndDeviceStore) *memory.DERLinkedEndDeviceStore {
+	return linkedEndDevices(devs, stores.serves(famDERs), func(devs store.EndDeviceStore) *memory.DERLinkedEndDeviceStore {
 		return memory.NewDERLinkedEndDeviceStore(devs, stores.DERs)
 	})
 }
@@ -740,9 +838,9 @@ func deviceKeyedCascadeEndDevices(devs store.EndDeviceStore, stores *Stores) sto
 	if store.IsAbsent(devs) {
 		return devs
 	}
-	if store.IsAbsent(stores.Configurations) && store.IsAbsent(stores.DeviceStatuses) &&
-		store.IsAbsent(stores.PowerStatuses) && store.IsAbsent(stores.FSAs) && store.IsAbsent(stores.AdminFSAs) &&
-		store.IsAbsent(stores.DERs) {
+	if !stores.serves(famConfiguration) && !stores.serves(famDeviceStatus) &&
+		!stores.serves(famPowerStatus) && store.IsAbsent(stores.FSAs) && store.IsAbsent(stores.AdminFSAs) &&
+		!stores.serves(famDERs) {
 		return devs
 	}
 	if linked, ok := devs.(*memory.DeviceKeyedCascadeEndDeviceStore); ok {
@@ -841,6 +939,25 @@ func flowReservationLinkedEndDevices(devs store.EndDeviceStore, stores *Stores) 
 	return memory.NewFlowReservationLinkedEndDeviceStore(devs, stores.FlowReservationRequests, resps)
 }
 
+// singletonLinkedEndDevices returns the EndDevice store the /edev routes must
+// use so every served EndDevice links its Configuration, DeviceStatus and
+// PowerStatus exactly when those routes are mounted.
+//
+// THE GATE IS THE MOUNT GATE: Stores.Configurations, DeviceStatuses and
+// PowerStatuses are the anchors registerNewFunctionSetRoutes tests. Like
+// [flowReservationLinkedEndDevices] it always wraps, so a link a client
+// supplied is cleared when none of the three is served.
+func singletonLinkedEndDevices(devs store.EndDeviceStore, stores *Stores) store.EndDeviceStore {
+	if store.IsAbsent(devs) {
+		return devs
+	}
+	return memory.NewSingletonLinkedEndDeviceStore(devs, memory.SingletonLinks{
+		Configuration: stores.serves(famConfiguration),
+		DeviceStatus:  stores.serves(famDeviceStatus),
+		PowerStatus:   stores.serves(famPowerStatus),
+	})
+}
+
 // ownedEndDevices returns the fully-decorated EndDevice store the /edev
 // routes and the read handle serve from: registration-bound,
 // LogEventList-linked, DERList-linked, device-keyed-cascade-wrapped,
@@ -861,7 +978,7 @@ func flowReservationLinkedEndDevices(devs store.EndDeviceStore, stores *Stores) 
 // RegistrationLink, LogEventListLink and flow reservation link derivations
 // make no difference to it.
 func ownedEndDevices(stores *Stores) store.EndDeviceStore {
-	return requireEndDevices(flowReservationLinkedEndDevices(deviceKeyedCascadeEndDevices(derLinkedEndDevices(logEventLinkedEndDevices(registrationBoundEndDevices(stores), stores), stores), stores), stores))
+	return requireEndDevices(singletonLinkedEndDevices(flowReservationLinkedEndDevices(deviceKeyedCascadeEndDevices(derLinkedEndDevices(logEventLinkedEndDevices(registrationBoundEndDevices(stores), stores), stores), stores), stores), stores))
 }
 
 func registerEndDeviceRoutes(mux routeRegistrar, stores *Stores, authPolicy AuthPolicy, notifier ResourceNotifier, canRead coresub.ReadCheck, inBandManagementOff bool, refusals func(r *http.Request, caller, reason string)) {
@@ -905,14 +1022,21 @@ func registerEndDeviceRoutes(mux routeRegistrar, stores *Stores, authPolicy Auth
 	// (GRIDAPPSD/ieee-2030_5-server-go#170).
 	if !store.IsAbsent(stores.Registrations) {
 		mux.HandleFunc("GET /edev/{id}/rg", corereg.HandleGetRegistration(edevs, stores.Registrations, authPolicy.Identity))
+		// A store without Upsert cannot make the PUT atomic, so the PUT is not
+		// mounted for it and the mux answers 405.
+		if up, ok := stores.Registrations.(corereg.Upserter); ok {
+			mux.HandleFunc("PUT /edev/{id}/rg", corereg.HandlePutRegistration(up))
+		}
+		mux.HandleFunc("DELETE /edev/{id}/rg", corereg.HandleDeleteRegistration(stores.Registrations))
 	}
 
 	// FSA endpoints
 	if !store.IsAbsent(stores.FSAs) {
+		wired := wiredAnchors(stores)
 		mux.HandleFunc("GET /edev/{id}/fsa", scopedListHandler[sep2.FunctionSetAssignments, sep2.FunctionSetAssignmentsList](
-			stores.FSAs, "id", store.SortByIDAsc, corefsa.BuildFSAList, 900,
+			stores.FSAs, "id", store.SortByIDAsc, corefsa.ListBuilder(wired), 900,
 		))
-		mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", corefsa.HandleFSA(stores.FSAs))
+		mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}", corefsa.HandleFSA(stores.FSAs, wired))
 	}
 
 	// Subscription endpoints
@@ -920,11 +1044,23 @@ func registerEndDeviceRoutes(mux routeRegistrar, stores *Stores, authPolicy Auth
 		mux.HandleFunc("GET /edev/{id}/sub", coresub.HandleListSubscriptionsByDevice(stores.Subscriptions, 900))
 		mux.HandleFunc("POST /edev/{id}/sub", coresub.HandleCreateSubscription(stores.Subscriptions, asNotificationURIValidator(notifier), canRead))
 		mux.HandleFunc("DELETE /edev/{id}/sub/{subId}", coresub.HandleDeleteSubscription(stores.Subscriptions, asNotifyRemoved(notifier)))
+		subInstance := coresub.HandleSubscription(stores.Subscriptions, asNotificationURIValidator(notifier), canRead)
+		mux.HandleFunc("GET /edev/{id}/sub/{subId}", subInstance)
+		mux.HandleFunc("PUT /edev/{id}/sub/{subId}", subInstance)
+	}
+}
+
+// lfdiProviderFor adapts the auth policy's identity function to the metering
+// handlers' LFDIProvider.
+func lfdiProviderFor(authPolicy AuthPolicy) coremetering.LFDIProvider {
+	return func(ctx context.Context) (string, bool) {
+		lfdi, _, ok := authPolicy.Identity(ctx)
+		return lfdi, ok
 	}
 }
 
 func registerMirrorRoutes(mux routeRegistrar, stores *Stores, authPolicy AuthPolicy, postRateProvider coremetering.PostRateProvider) {
-	if store.IsAbsent(stores.MirrorUsagePoints) {
+	if !stores.serves(famMirrorUsagePoints) {
 		return
 	}
 	// MirrorMeterReadings has no gate of its own: it is mounted on the
@@ -933,19 +1069,19 @@ func registerMirrorRoutes(mux routeRegistrar, stores *Stores, authPolicy AuthPol
 	// LFDIProvider extracts the device LFDI from the request context via the
 	// injected AuthPolicy.Identity. Keeps internal/auth out of core (the same
 	// callback-injection pattern that Phase D1 applied to the obs callback).
-	lfdiProvider := coremetering.LFDIProvider(func(ctx context.Context) (string, bool) {
-		lfdi, _, ok := authPolicy.Identity(ctx)
-		return lfdi, ok
-	})
+	lfdiProvider := lfdiProviderFor(authPolicy)
 	// A manager acts on /mup for a managed device only when that device has an
 	// EndDevice record, as GET /edev already requires.
 	requireRecords := coremetering.RequireDeviceRecords(stores.EndDevices)
-	mux.HandleFunc("GET /mup", corelisthandler.ListHandler[sep2.MirrorUsagePoint, sep2.MirrorUsagePointList](
-		stores.MirrorUsagePoints, coremetering.BuildMirrorUsagePointList, 300,
+	mux.HandleFunc("GET /mup", coremetering.HandleMirrorUsagePointList(
+		stores.MirrorUsagePoints, stores.EndDeviceManagers, lfdiProvider, 300, requireRecords,
 	))
 	mux.HandleFunc("POST /mup", coremetering.HandleCreateMirrorUsagePoint(stores.MirrorUsagePoints, stores.EndDeviceManagers, lfdiProvider, postRateProvider, requireRecords))
 	mux.HandleFunc("GET /mup/{id}", coremetering.HandleMirrorUsagePoint(stores.MirrorUsagePoints, stores.EndDeviceManagers, lfdiProvider, requireRecords))
 	mux.HandleFunc("POST /mup/{id}/mr", coremetering.HandlePostMirrorMeterReading(
+		stores.MirrorUsagePoints, mirrorMeterReadings, stores.EndDeviceManagers, lfdiProvider, requireRecords,
+	))
+	mux.HandleFunc("GET /mup/{id}/mr/{mrId}", coremetering.HandleMirrorMeterReading(
 		stores.MirrorUsagePoints, mirrorMeterReadings, stores.EndDeviceManagers, lfdiProvider, requireRecords,
 	))
 
@@ -995,7 +1131,7 @@ func registerMirrorRoutes(mux routeRegistrar, stores *Stores, authPolicy AuthPol
 }
 
 func registerDERRoutes(mux routeRegistrar, stores *Stores) {
-	if store.IsAbsent(stores.DERs) {
+	if !stores.serves(famDERs) {
 		return
 	}
 
@@ -1027,7 +1163,10 @@ func registerDERRoutes(mux routeRegistrar, stores *Stores) {
 	// control count in the scope the link names (issue context: a control
 	// added after boot must be counted), independent of whether an issuer's
 	// lifecycle store is wired.
-	derPrograms = coreder.NewDERControlCountedProgramStore(derPrograms, derControls)
+	// Its ActiveDERControlListLink is served because the actderc route below
+	// is mounted, and counts the same controls that route lists.
+	activeControls := coreder.NewActiveControlStore(derControls)
+	derPrograms = coreder.NewDERControlCountedProgramStore(derPrograms, derControls).WithActiveList(activeControls).WithCurveList(derCurves)
 
 	// The protocol routes below read through these two, which note the served
 	// mRIDs on the request's device log line. derPrograms above counts the
@@ -1035,6 +1174,7 @@ func registerDERRoutes(mux routeRegistrar, stores *Stores) {
 	// decorator wraps the ordering wrapper, not the other way round, so List
 	// notes the page that was served rather than the whole collection.
 	servedControls := devicelog.NewServedStore(store.OrderedScoped(derControls, coreder.CompareDERControl), func(c sep2.DERControl) string { return c.MRID })
+	servedActive := devicelog.NewServedStore(store.OrderedScoped(activeControls, coreder.CompareDERControl), func(c sep2.DERControl) string { return c.MRID })
 	servedDefaults := devicelog.NewServedStore(defaultDERControls, func(c sep2.DefaultDERControl) string { return c.MRID })
 
 	dercap, derg, ders, dera := coreder.DERSingletonHandlers(
@@ -1057,6 +1197,11 @@ func registerDERRoutes(mux routeRegistrar, stores *Stores) {
 		Settings:     true,
 		Status:       true,
 		Availability: true,
+		// The associated program list is mounted below for every DER. The two
+		// record-backed links are advertised only on a DER that stores one.
+		AssociatedPrograms:   true,
+		CurrentProgram:       true,
+		AssociatedUsagePoint: stores.serves(famUsagePoints),
 	}
 
 	// The four DER lists below are served in the Table 50 order section 4.6.1
@@ -1085,6 +1230,14 @@ func registerDERRoutes(mux routeRegistrar, stores *Stores) {
 	mux.HandleFunc("GET /edev/{id}/der/{derId}", derInstance)
 	mux.HandleFunc("PUT /edev/{id}/der/{derId}", derInstance)
 
+	// The DER's program associations, resolved against the DER as stored.
+	unscopedDER := newUnscopedProgramWarnings(log.Printf)
+	mux.HandleFunc("GET /edev/{id}/der/{derId}/derp", associatedProgramListHandler(stores.DERs, derPrograms, unscopedDER))
+	mux.HandleFunc("GET /edev/{id}/der/{derId}/cdp", currentProgramHandler(stores.DERs, derPrograms, unscopedDER))
+	if stores.serves(famUsagePoints) {
+		mux.HandleFunc("GET /edev/{id}/der/{derId}/upt", associatedUsagePointHandler(stores.DERs, stores.UsagePoints))
+	}
+
 	mux.HandleFunc("GET /edev/{id}/der/{derId}/dercap", dercap)
 	mux.HandleFunc("PUT /edev/{id}/der/{derId}/dercap", dercap)
 	mux.HandleFunc("GET /edev/{id}/der/{derId}/derg", derg)
@@ -1112,10 +1265,21 @@ func registerDERRoutes(mux routeRegistrar, stores *Stores) {
 	// single-resource route just below.
 	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}/derp/{derpId}", derProgramHandler(derPrograms, unscoped))
 
+	// The curve catalog under a program, and one curve at its program-scoped href.
+	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dc", programCurveListHandler(derCurves, derPrograms, unscoped))
+	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/dc/{dcId}", programCurveHandler(derCurves, derPrograms, unscoped))
+
 	// DERControl under DERProgram
 	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/derc",
 		scopedListHandlerDeep[sep2.DERControl, sep2.DERControlList](
 			servedControls, store.SortByListOrdering, coreder.BuildDERControlList, 900,
+		))
+
+	// The controls of the program that are Active now, in the control
+	// list's order and paging.
+	mux.HandleFunc("GET /edev/{id}/fsa/{fsaId}/derp/{derpId}/actderc",
+		scopedListHandlerDeep[sep2.DERControl, sep2.DERControlList](
+			servedActive, store.SortByListOrdering, coreder.BuildDERControlList, 900,
 		))
 
 	// A DERControl's own href, so an activated event resolves. A client that
@@ -1149,6 +1313,9 @@ func registerDERRoutes(mux routeRegistrar, stores *Stores) {
 	mux.HandleFunc("GET /dc", corelisthandler.SortedListHandler[sep2.DERCurve, sep2.DERCurveList](
 		store.Ordered(derCurves, coreder.CompareDERCurve), store.SortByListOrdering, coreder.BuildDERCurveList, 900,
 	))
+	// The href a DERControl's curve link carries (dercurve.Href). Same /dc
+	// family as the list, so the same read-only, DER-anchored access rule.
+	mux.HandleFunc("GET /dc/{dcId}", curveHandler(derCurves))
 }
 
 // scopedListHandler creates a list handler scoped by the path value named
@@ -1186,8 +1353,29 @@ func scopedListHandlerDeep[T store.Copier[T], L any](
 	buildList func(href string, result store.ListResult[T], pollRate uint32) L,
 	pollRate uint32,
 ) http.HandlerFunc {
+	return scopedListHandlerAt(deepScopeKey, scopedStore, sort, buildList, pollRate)
+}
+
+// scopedListHandlerAt creates a list handler scoped by the key scope derives
+// from the request, for a parent that is more than one path value deep. The
+// list route and the instance route of one resource kind pass the same scope
+// function, so they cannot disagree about where a record lives.
+//
+// A scope that reports ok false names no record's parent, so the route answers
+// 404 rather than listing under a key the request forged.
+func scopedListHandlerAt[T store.Copier[T], L any](
+	scope scopeFunc,
+	scopedStore store.ScopedStore[T],
+	sort store.SortKey,
+	buildList func(href string, result store.ListResult[T], pollRate uint32) L,
+	pollRate uint32,
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := deepScopeKey(r)
+		key, ok := scope(r)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 		st := store.Under(scopedStore, key)
 		h := corelisthandler.SortedListHandler[T, L](st, sort, buildList, pollRate)
 		h.ServeHTTP(w, r)
@@ -1207,9 +1395,13 @@ func scopedListHandlerDeep[T store.Copier[T], L any](
 // bind a CALLER to that path; store scoping and caller ownership are different
 // properties, and this function implements only the former. Caller ownership
 // of {id} is enforced before any handler runs, by ownershipGate.
-func deepScopeKey(r *http.Request) string {
-	return derhref.ScopeKey(r.PathValue("id"), r.PathValue("fsaId"), r.PathValue("derpId"))
+func deepScopeKey(r *http.Request) (string, bool) {
+	return derhref.ScopeKey(r.PathValue("id"), r.PathValue("fsaId"), r.PathValue("derpId")), true
 }
+
+// scopeFunc derives a store parent key from the request's path values. ok is
+// false when the values cannot name a parent, and the route then answers 404.
+type scopeFunc func(r *http.Request) (key string, ok bool)
 
 // scopedResourceHandlerDeep creates a read-only single-resource handler scoped
 // by the same composite key id/fsaId/derpId as scopedListHandlerDeep, keyed
@@ -1239,35 +1431,19 @@ func scopedResourceHandlerDeep[T store.Copier[T]](
 	idParam string,
 	stamp func(r *http.Request, resource *T),
 ) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			encoding.MethodNotAllowed(w, "GET, HEAD")
-			return
-		}
-
-		resource, err := scopedStore.Get(r.Context(), deepScopeKey(r), r.PathValue(idParam))
-		if err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				http.Error(w, "not found", http.StatusNotFound)
-				return
-			}
-			srverr.Internal(w, r, err)
-			return
-		}
-
-		if stamp != nil {
-			stamp(r, &resource)
-		}
-
-		encoding.WriteXML(w, http.StatusOK, &resource)
-	}
+	return scopedResourceHandlerAt(deepScopeKey, scopedStore, idParam, stamp)
 }
 
-// maxRequestBody caps how much of a request body this package reads into
-// memory. It matches the limit the singleton handler applies to the DER
-// sub-resources (handlers/singleton), so a client cannot find a larger document
-// accepted on one DER path than on its neighbour.
-const maxRequestBody = 1 << 20
+// scopedResourceHandlerAt is [scopedResourceHandlerDeep] with the scope taken
+// from scope rather than fixed to the DERProgram key, and keeps its contract.
+func scopedResourceHandlerAt[T store.Copier[T]](
+	scope scopeFunc,
+	scopedStore store.ScopedStore[T],
+	idParam string,
+	stamp func(r *http.Request, resource *T),
+) http.HandlerFunc {
+	return scopedResourceHandlerWith(scope, scopedStore, idParam, itemMethods{}, stamp)
+}
 
 // itemMethods declares which WADL-declared methods a [scopedResourceHandler]
 // mount implements beyond GET and HEAD, which every mount serves.
@@ -1283,6 +1459,12 @@ type itemMethods struct {
 	// Put mounts PUT on the resource, upserting the request body at the id the
 	// path names.
 	Put bool
+
+	// PutUpdateOnly mounts PUT as a replace of a record that already exists:
+	// an id with no stored record answers 404 and creates nothing. Use it
+	// where the id is the client's to choose, so an upsert would let the client
+	// pick the key. It takes the place of Put, not in addition to it.
+	PutUpdateOnly bool
 
 	// Delete mounts DELETE on the resource, removing the record the path
 	// names. It is a WRITE, and this helper carries no ownership binding of its
@@ -1303,7 +1485,7 @@ func (m itemMethods) allow() string {
 	if m.Delete {
 		allowed = append(allowed, "DELETE")
 	}
-	if m.Put {
+	if m.Put || m.PutUpdateOnly {
 		allowed = append(allowed, "PUT")
 	}
 	sort.Strings(allowed)
@@ -1360,19 +1542,35 @@ func scopedResourceHandler[T store.Copier[T]](
 	methods itemMethods,
 	stamp func(r *http.Request, resource *T),
 ) http.HandlerFunc {
+	return scopedResourceHandlerWith(func(r *http.Request) (string, bool) {
+		return r.PathValue(parentParam), true
+	}, scopedStore, idParam, methods, stamp)
+}
+
+// scopedResourceHandlerWith is the one definition of the scoped
+// single-resource handler: [scopedResourceHandler] scopes it by one path value
+// and [scopedResourceHandlerAt] by a derived key, and both are read-only unless
+// methods says otherwise.
+func scopedResourceHandlerWith[T store.Copier[T]](
+	scope scopeFunc,
+	scopedStore store.ScopedStore[T],
+	idParam string,
+	methods itemMethods,
+	stamp func(r *http.Request, resource *T),
+) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		parentKey := r.PathValue(parentParam)
+		parentKey, ok := scope(r)
+		if !ok {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
 		id := r.PathValue(idParam)
 
 		switch {
 		case r.Method == http.MethodGet, r.Method == http.MethodHead:
 			resource, err := scopedStore.Get(r.Context(), parentKey, id)
 			if err != nil {
-				if errors.Is(err, store.ErrNotFound) {
-					http.Error(w, "not found", http.StatusNotFound)
-					return
-				}
-				srverr.Internal(w, r, err)
+				writeLookupFailure(w, r, err)
 				return
 			}
 			if stamp != nil {
@@ -1380,8 +1578,8 @@ func scopedResourceHandler[T store.Copier[T]](
 			}
 			encoding.WriteXML(w, http.StatusOK, &resource)
 
-		case r.Method == http.MethodPut && methods.Put:
-			body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
+		case r.Method == http.MethodPut && (methods.Put || methods.PutUpdateOnly):
+			body, err := io.ReadAll(io.LimitReader(r.Body, reqlimit.MaxBody))
 			if err != nil {
 				http.Error(w, "read body failed", http.StatusBadRequest)
 				return
@@ -1396,6 +1594,16 @@ func scopedResourceHandler[T store.Copier[T]](
 			// href and any link it invented never reach the store.
 			if stamp != nil {
 				stamp(r, &resource)
+			}
+			if methods.PutUpdateOnly {
+				// One Update, no Create: a DELETE that wins the race is a 404,
+				// and the client's id never becomes a new key.
+				if err := scopedStore.Update(r.Context(), parentKey, id, resource); err != nil {
+					writeLookupFailure(w, r, err)
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return
 			}
 			if err := scopedStore.Create(r.Context(), parentKey, id, resource); err != nil {
 				if !errors.Is(err, store.ErrAlreadyExists) {
@@ -1414,11 +1622,7 @@ func scopedResourceHandler[T store.Copier[T]](
 			// there tells a client its delete took effect, and a client that
 			// believes a stale event is gone stops reconciling it.
 			if err := scopedStore.Delete(r.Context(), parentKey, id); err != nil {
-				if errors.Is(err, store.ErrNotFound) {
-					http.Error(w, "not found", http.StatusNotFound)
-					return
-				}
-				srverr.Internal(w, r, err)
+				writeLookupFailure(w, r, err)
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -1429,44 +1633,145 @@ func scopedResourceHandler[T store.Copier[T]](
 	}
 }
 
-func registerMeteringRoutes(mux routeRegistrar, stores *Stores) {
-	if store.IsAbsent(stores.UsagePoints) {
+func registerMeteringRoutes(mux routeRegistrar, stores *Stores, authPolicy AuthPolicy) {
+	if !stores.serves(famUsagePoints) {
 		return
 	}
-	// None of these three has a gate of its own: all are mounted on the
+	// None of these four has a gate of its own: all are mounted on the
 	// strength of UsagePoints (see miswired.go).
 	meterReadings := requireScoped(stores.MeterReadings, "MeterReadings")
+	readingSets := requireScoped(stores.ReadingSets, "ReadingSets")
 	readings := requireScoped(stores.Readings, "Readings")
-	readingTypes := requireResource(stores.ReadingTypes, "ReadingTypes")
-	mux.HandleFunc("GET /upt", corelisthandler.ListHandler[sep2.UsagePoint, sep2.UsagePointList](
-		stores.UsagePoints, coremetering.BuildUsagePointList, 900,
+	readingTypes := requireScoped(stores.ReadingTypes, "ReadingTypes")
+	mux.HandleFunc("GET /upt", coremetering.HandleUsagePointList(
+		stores.UsagePoints, stores.EndDeviceManagers, lfdiProviderFor(authPolicy), 900,
 	))
 	mux.HandleFunc("POST /upt", coremetering.HandleCreateUsagePoint(stores.UsagePoints))
 	mux.HandleFunc("GET /upt/{uptId}", coremetering.HandleUsagePoint(stores.UsagePoints))
 
+	// The reading hierarchy under a UsagePoint, at the WADL addresses
+	// (sep_wadl.xml: /upt/{id1}/mr/{id2} and below). Lists are served in the
+	// Table 39 order (IEEE 2030.5-2018 section 10.4.2). Reads only: the
+	// Optional writes are a separate slice.
+	meterReadingsOrdered := store.OrderedScoped(meterReadings, coremetering.CompareMeterReading)
+	readingSetsOrdered := store.OrderedScoped(readingSets, coremetering.CompareReadingSet)
+	readingsOrdered := store.OrderedScoped(readings, coremetering.CompareReading)
+	setScope := func(r *http.Request) (string, bool) {
+		return coremetering.ReadingSetScopeKey(r.PathValue("uptId"), r.PathValue("mrId"))
+	}
+	readingScope := func(r *http.Request) (string, bool) {
+		return coremetering.ReadingScopeKey(r.PathValue("uptId"), r.PathValue("mrId"), r.PathValue("rsId"))
+	}
+	// A list under a parent that does not exist is a 404, not an empty 200.
+	meterReadingExists := func(r *http.Request) error {
+		_, err := meterReadings.Get(r.Context(), r.PathValue("uptId"), r.PathValue("mrId"))
+		return err
+	}
+	readingSetExists := func(r *http.Request) error {
+		parent, ok := setScope(r)
+		if !ok {
+			return store.ErrNotFound
+		}
+		_, err := readingSets.Get(r.Context(), parent, r.PathValue("rsId"))
+		return err
+	}
+
 	mux.HandleFunc("GET /upt/{uptId}/mr", scopedListHandler[sep2.MeterReading, sep2.MeterReadingList](
-		meterReadings, "uptId", store.SortByIDAsc, coremetering.BuildMeterReadingList, 900,
+		meterReadingsOrdered, "uptId", store.SortByListOrdering, coremetering.BuildMeterReadingList, 900,
 	))
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}",
+		scopedResourceHandler[sep2.MeterReading](meterReadings, "uptId", "mrId", itemMethods{}, nil))
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/rt", coremetering.HandleMeterReadingType(readingTypes))
 
-	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/r", func(w http.ResponseWriter, r *http.Request) {
-		key := r.PathValue("uptId") + "/" + r.PathValue("mrId")
-		st := store.Under(readings, key)
-		h := corelisthandler.ListHandler[sep2.Reading, sep2.ReadingList](st, coremetering.BuildReadingList, 900)
-		h.ServeHTTP(w, r)
-	})
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/rs", requireParent(meterReadingExists, scopedListHandlerAt[sep2.ReadingSet, sep2.ReadingSetList](
+		setScope, readingSetsOrdered, store.SortByListOrdering, coremetering.BuildReadingSetList, 900,
+	)))
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/rs/{rsId}",
+		scopedResourceHandlerAt[sep2.ReadingSet](setScope, readingSets, "rsId", nil))
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/rs/{rsId}/r", requireParent(readingSetExists, scopedListHandlerAt[sep2.Reading, sep2.ReadingList](
+		readingScope, readingsOrdered, store.SortByListOrdering, coremetering.BuildReadingList, 900,
+	)))
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}",
+		scopedResourceHandlerAt[sep2.Reading](readingScope, readings, "rId", nil))
 
+	mux.HandleFunc("GET /upt/{uptId}/mr/{mrId}/r", requireParent(meterReadingExists, scopedListHandlerAt[sep2.Reading, sep2.ReadingList](
+		setScope, readingsOrdered, store.SortByListOrdering, coremetering.BuildReadingList, 900,
+	)))
+
+	// The flat /rt routes serve only the ReadingTypes held under the empty
+	// parent. A MeterReading's own ReadingType lives under its UsagePoint and is
+	// reachable only at /upt/{uptId}/mr/{mrId}/rt.
+	flatReadingTypes := store.Under(readingTypes, "")
 	mux.HandleFunc("GET /rt", corelisthandler.ListHandler[sep2.ReadingType, sep2.ReadingTypeList](
-		readingTypes, coremetering.BuildReadingTypeList, 900,
+		flatReadingTypes, coremetering.BuildReadingTypeList, 900,
 	))
-	mux.HandleFunc("GET /rt/{id}", coremetering.HandleReadingType(readingTypes))
+	mux.HandleFunc("GET /rt/{id}", coremetering.HandleReadingType(flatReadingTypes))
+
+	registerMeteringWrites(mux, stores, meterReadings, readingSets, readings, readingTypes, readingScope)
+}
+
+// registerMeteringWrites mounts the Optional PUTs and DELETEs on records that
+// exist. Each is a manager-only write (manager_only.go), so none checks the
+// caller. A PUT replaces a stored record and never creates one, so the client
+// does not choose a key.
+func registerMeteringWrites(
+	mux routeRegistrar,
+	stores *Stores,
+	meterReadings store.ScopedStore[sep2.MeterReading],
+	readingSets store.ScopedStore[sep2.ReadingSet],
+	readings store.ScopedStore[sep2.Reading],
+	readingTypes store.ScopedStore[sep2.ReadingType],
+	readingScope scopeFunc,
+) {
+	tree := coremetering.UsagePointTree{
+		UsagePoints: stores.UsagePoints, MeterReadings: meterReadings,
+		ReadingSets: readingSets, Readings: readings, ReadingTypes: readingTypes,
+	}
+	mux.HandleFunc("DELETE /upt/{uptId}", coremetering.HandleDeleteUsagePoint(tree))
+	mux.HandleFunc("DELETE /upt/{uptId}/mr/{mrId}", coremetering.HandleDeleteMeterReading(tree))
+	mux.HandleFunc("DELETE /upt/{uptId}/mr/{mrId}/rs/{rsId}", coremetering.HandleDeleteReadingSet(tree))
+
+	// The href is the address the PUT named, never the client's own.
+	mux.HandleFunc("PUT /upt/{uptId}/mr/{mrId}/rt", scopedResourceHandler(readingTypes, "uptId", "mrId",
+		itemMethods{PutUpdateOnly: true},
+		func(r *http.Request, rt *sep2.ReadingType) { rt.Href = r.URL.Path }))
+	readingItem := itemMethods{PutUpdateOnly: true, Delete: true}
+	readingStamp := func(r *http.Request, rd *sep2.Reading) { rd.Href = r.URL.Path }
+	mux.HandleFunc("PUT /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}",
+		scopedResourceHandlerWith(readingScope, readings, "rId", readingItem, readingStamp))
+	mux.HandleFunc("DELETE /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}",
+		scopedResourceHandlerWith(readingScope, readings, "rId", readingItem, readingStamp))
+}
+
+// writeLookupFailure answers a failed store read: store.ErrNotFound is the
+// only error that may say "absent" (404); any other is a 500.
+func writeLookupFailure(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	srverr.Internal(w, r, err)
+}
+
+// requireParent runs exists before next and answers 404 when the parent it
+// checks is absent, so a list under a missing parent is not served as an empty
+// 200. A failed check is a 500: only store.ErrNotFound may say "absent".
+func requireParent(exists func(r *http.Request) error, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := exists(r); err != nil {
+			writeLookupFailure(w, r, err)
+			return
+		}
+		next(w, r)
+	}
 }
 
 func registerNewFunctionSetRoutes(mux routeRegistrar, stores *Stores, pen *uint32, frpDeadline, frpPendingPollRate time.Duration, identity identity.Func, deviceLog *devicelog.Writer, deviceLogResolver *devicelog.CachingResolver, notifier ResourceNotifier) {
-	if !store.IsAbsent(stores.Configurations) {
+	if stores.serves(famConfiguration) {
 		mux.HandleFunc("GET /edev/{id}/cfg", coreconfiguration.HandleConfiguration(stores.Configurations))
 		mux.HandleFunc("PUT /edev/{id}/cfg", coreconfiguration.HandleConfiguration(stores.Configurations))
 	}
-	if !store.IsAbsent(stores.DeviceStatuses) {
+	if stores.serves(famDeviceStatus) {
 		mux.HandleFunc("GET /edev/{id}/dstat", coresingleton.HandleSingletonGetPut[sep2.DeviceStatus](
 			stores.DeviceStatuses,
 			func(r *http.Request) string { return r.PathValue("id") },
@@ -1485,6 +1790,17 @@ func registerNewFunctionSetRoutes(mux routeRegistrar, stores *Stores, pen *uint3
 				return ds
 			},
 		))
+		// DELETE (mode O) removes the device's one stored status. The shared
+		// scoped delete is reused, with the singleton key supplied as the id
+		// path value the helper reads.
+		deleteDeviceStatus := scopedResourceHandler[sep2.DeviceStatus](
+			stores.DeviceStatuses, "id", "dstatKey", itemMethods{Delete: true}, nil)
+		mux.HandleFunc("DELETE /edev/{id}/dstat", func(w http.ResponseWriter, r *http.Request) {
+			// The helper reads the id from a path value; the singleton's one
+			// key is supplied here because the route carries none.
+			r.SetPathValue("dstatKey", coresingleton.SingletonKey)
+			deleteDeviceStatus(w, r)
+		})
 	}
 	if !store.IsAbsent(stores.LogEvents) {
 		// The LogEvent function set at its WADL address.
@@ -1505,43 +1821,60 @@ func registerNewFunctionSetRoutes(mux routeRegistrar, stores *Stores, pen *uint3
 		// a client a different LogEvent set depending on which it used.
 		//
 		// GET, HEAD and POST are mode M on the list; GET, HEAD and DELETE are
-		// mode M on the instance. Every Mandatory method is mounted. PUT and
-		// DELETE on the list (mode E), and PUT (mode O) and POST (mode E) on
-		// the instance, are not, and each answers 405 from http.ServeMux with
-		// an Allow derived from the registered method set.
+		// mode M on the instance, and PUT (mode O) is mounted there
+		// too. PUT and DELETE on the list (mode E) and POST (mode E) on the
+		// instance are not, and each answers 405 from http.ServeMux with an
+		// Allow derived from the registered method set.
 		//
-		// DELETE on the instance is a WRITE; the caller's ownership of {id} is
-		// enforced by ownershipGate, and scopedResourceHandler adds none of its
-		// own. It is mounted because the WADL declares it Mandatory.
+		// PUT and DELETE on the instance are WRITES; the caller's ownership of
+		// {id} is enforced by ownershipGate, and scopedResourceHandler adds none
+		// of its own.
 		mux.HandleFunc("GET /edev/{id}/lel", scopedListHandler[sep2.LogEvent, sep2.LogEventList](
 			stores.LogEvents, "id", store.SortByIDAsc, corelogevent.BuildLogEventList, 900,
 		))
-		// Only the create path is decorated: the device log records what a
-		// device posted, and the list and instance routes read the plain store.
-		mux.HandleFunc("POST /edev/{id}/lel", corelogevent.HandlePostLogEvent(
-			devicelog.NewLogEventStore(stores.LogEvents, deviceLog, identity, deviceLogResolver.Resolve)))
+		// POST and PUT go through the device-log decorator: the device log
+		// records what a device posted or replaced, and it is the only copy
+		// that survives a restart. GET and DELETE reach the inner store.
+		logEvents := devicelog.NewLogEventStore(stores.LogEvents, deviceLog, identity, deviceLogResolver.Resolve)
+		mux.HandleFunc("POST /edev/{id}/lel", corelogevent.HandlePostLogEvent(logEvents))
 
+		// PUT (mode O) replaces an event that exists and never creates one: the
+		// id in the path is the client's, and POST is what mints ids. The stamp
+		// settles the stored href from path values that matched a stored id.
+		const lelParent, lelParam = "id", "lelId"
 		logEventInstance := scopedResourceHandler[sep2.LogEvent](
-			stores.LogEvents, "id", "lelId", itemMethods{Delete: true}, nil)
+			logEvents, lelParent, lelParam, itemMethods{PutUpdateOnly: true, Delete: true},
+			func(r *http.Request, e *sep2.LogEvent) {
+				e.Href = corelogevent.InstanceHref(r.PathValue(lelParent), r.PathValue(lelParam))
+			})
 		mux.HandleFunc("GET /edev/{id}/lel/{lelId}", logEventInstance)
+		mux.HandleFunc("PUT /edev/{id}/lel/{lelId}", logEventInstance)
 		mux.HandleFunc("DELETE /edev/{id}/lel/{lelId}", logEventInstance)
 	}
-	if !store.IsAbsent(stores.PowerStatuses) {
+	if stores.serves(famPowerStatus) {
 		mux.HandleFunc("GET /edev/{id}/ps", corepowerstatus.HandlePowerStatus(stores.PowerStatuses))
 		mux.HandleFunc("PUT /edev/{id}/ps", corepowerstatus.HandlePowerStatus(stores.PowerStatuses))
 	}
 
-	if !store.IsAbsent(stores.MessagingPrograms) {
+	if stores.serves(famMessagingPrograms) {
 		// TextMessages has no gate of its own: it is mounted on the strength
 		// of MessagingPrograms (see miswired.go).
 		textMessages := requireScoped(stores.TextMessages, "TextMessages")
 
+		// Each served program advertises its ActiveTextMessageListLink, which
+		// the acttm route below serves, counting the same messages.
+		activeMessages := coremessaging.NewActiveTextMessageStore(textMessages)
+		messagingPrograms := coremessaging.NewActiveLinkProgramStore(stores.MessagingPrograms, activeMessages)
+
 		mux.HandleFunc("GET /msg", corelisthandler.ListHandler[sep2.MessagingProgram, sep2.MessagingProgramList](
-			stores.MessagingPrograms, coremessaging.BuildMessagingProgramList, 900,
+			messagingPrograms, coremessaging.BuildMessagingProgramList, 900,
 		))
-		mux.HandleFunc("GET /msg/{msgId}", coremessaging.HandleMessagingProgram(stores.MessagingPrograms))
+		mux.HandleFunc("GET /msg/{msgId}", coremessaging.HandleMessagingProgram(messagingPrograms))
 		mux.HandleFunc("GET /msg/{msgId}/tm", scopedListHandler[sep2.TextMessage, sep2.TextMessageList](
 			textMessages, "msgId", store.SortByIDAsc, coremessaging.BuildTextMessageList, 900,
+		))
+		mux.HandleFunc("GET /msg/{msgId}/acttm", scopedListHandler[sep2.TextMessage, sep2.TextMessageList](
+			activeMessages, "msgId", store.SortByIDAsc, coremessaging.BuildTextMessageList, 900,
 		))
 		mux.HandleFunc("POST /msg/{msgId}/tm", coremessaging.HandlePostTextMessage(textMessages))
 
@@ -1613,11 +1946,24 @@ func registerNewFunctionSetRoutes(mux routeRegistrar, stores *Stores, pen *uint3
 		// from the registered method set.
 		//
 		// PUT on the request is the client's withdrawal (#667, mode M at
-		// sep_wadl.xml:3963): it changes only RequestStatus. POST and DELETE
-		// answer 405 from the registered method set.
+		// sep_wadl.xml:3963): it changes only RequestStatus. POST answers 405
+		// from the registered method set.
 		frqInstance := scopedResourceHandler[sep2.FlowReservationRequest](
 			stores.FlowReservationRequests, "id", "frqId", itemMethods{}, nil)
 		mux.HandleFunc("GET /edev/{id}/frq/{frqId}", frqInstance)
+		// DELETE (mode O) removes a request whose responses have all ended,
+		// with them and their lifecycle and answer records, through the
+		// retention sweep's own delete. The answer records go with them when
+		// Stores.FlowReservationAnswers is set; the responses store's cascade
+		// covers only a whole-device removal, not one request. Deprecated DELETE on the
+		// response (mode D) stays 405: deleting a response alone would orphan
+		// its request, which recovery would then answer again.
+		mux.HandleFunc("DELETE /edev/{id}/frq/{frqId}", coreflowrsv.HandleDeleteFlowReservationRequest(
+			flowreservation.NewRetention(
+				stores.FlowReservationRequests, flowReservationResponses, stores.FlowReservationResponseLifecycles,
+				stores.FlowReservationAnswers, stores.CommitmentLedger,
+				commitment.Resolver{Devices: stores.EndDevices, Managers: stores.EndDeviceManagers}, notifier),
+			time.Now))
 		mux.HandleFunc("PUT /edev/{id}/frq/{frqId}", coreflowrsv.HandlePutFlowReservationRequest(
 			stores.FlowReservationRequests,
 			flowreservation.NewCanceller(
@@ -1632,7 +1978,7 @@ func registerNewFunctionSetRoutes(mux routeRegistrar, stores *Stores, pen *uint3
 		mux.HandleFunc("GET /edev/{id}/frp/{frpId}", frpInstance)
 	}
 
-	if !store.IsAbsent(stores.ResponseSets) {
+	if stores.serves(famResponseSets) {
 		// Responses has no gate of its own: it is mounted on the strength of
 		// ResponseSets, and every DERControl this server emits carries a
 		// replyTo into it (see miswired.go).

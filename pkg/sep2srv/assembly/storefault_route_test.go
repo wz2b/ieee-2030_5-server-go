@@ -1,6 +1,7 @@
 package assembly_test
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -9,7 +10,10 @@ import (
 	"testing"
 
 	"github.com/GRIDAPPSD/ieee-2030_5-core-go/pkg/sep2"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/commitment/sources"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/internal/dercontrol"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/sep2srv/assembly"
+	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store/memory"
 	"github.com/GRIDAPPSD/ieee-2030_5-server-go/pkg/store/storetest"
 )
@@ -44,6 +48,21 @@ import (
 // several handlers treat as a 400 before any store is touched.
 const faultProbePathValue = "1"
 
+// faultProbeManagedID is the EndDevice the manager-only probes address: the
+// probe identity manages it, and the manager-only check reads it, where the
+// device at faultProbePathValue is the probe identity's own.
+const (
+	faultProbeManagedID   = "managed"
+	faultProbeManagedLFDI = "1122334455667788990011223344556677889900"
+)
+
+// faultProbeManagerOnly names the patterns the manager-only check decides, which
+// are probed at faultProbeManagedID.
+var faultProbeManagerOnly = map[string]bool{
+	"PUT /edev/{id}/rg":    true,
+	"DELETE /edev/{id}/rg": true,
+}
+
 // storeFreeRoutes are the mounted patterns a store failure cannot reach,
 // with the reason each one cannot.
 //
@@ -57,17 +76,20 @@ var storeFreeRoutes = map[string]string{
 	"GET /tm":       "serves the clock from RouterConfig; it reads no store",
 	"GET /sdev":     "serves the server's own SelfDevice from the configured SFDI and LFDI; it reads no store",
 	"GET /sdev/sdi": "serves the server's own DeviceInformation from the configured LFDI; it reads no store",
+	"POST /ntfy":    "this harness runs with the device log off, where the handler answers 503 before reading any store",
 
 	// The subscription store is NOT part of the pkg/store contract: it is
 	// queried by resource href and by device, and its records carry a store key
 	// alongside the resource, so no interface in pkg/store expresses it and
 	// Stores.Subscriptions is a concrete *memory.SubscriptionStore. There is
 	// nothing here to inject a contract-level fault into. When that store is
-	// brought under the contract, these three lose their exemption and the
+	// brought under the contract, these five lose their exemption and the
 	// partition check below is what forces them back into the table.
 	"GET /edev/{id}/sub":            "backed by *memory.SubscriptionStore, which pkg/store does not model",
 	"POST /edev/{id}/sub":           "backed by *memory.SubscriptionStore, which pkg/store does not model",
 	"DELETE /edev/{id}/sub/{subId}": "backed by *memory.SubscriptionStore, which pkg/store does not model",
+	"GET /edev/{id}/sub/{subId}":    "backed by *memory.SubscriptionStore, which pkg/store does not model",
+	"PUT /edev/{id}/sub/{subId}":    "backed by *memory.SubscriptionStore, which pkg/store does not model",
 }
 
 // faultProbeBodies supplies the request document for every mounted pattern
@@ -85,6 +107,12 @@ var faultProbeBodies = map[string]string{
 	"PUT /edev/{id}": sep2Doc("EndDevice",
 		`<lFDI>`+testLFDI+`</lFDI>`),
 
+	"PUT /edev/{id}/lel/{lelId}": sep2Doc("LogEvent",
+		`<createdDateTime>1700000000</createdDateTime>`+
+			`<logEventCode>1</logEventCode>`+
+			`<logEventID>42</logEventID>`+
+			`<logEventPEN>37244</logEventPEN>`+
+			`<profileID>2</profileID>`),
 	"POST /edev/{id}/lel": sep2Doc("LogEvent",
 		`<createdDateTime>1700000000</createdDateTime>`+
 			`<logEventCode>1</logEventCode>`+
@@ -111,6 +139,11 @@ var faultProbeBodies = map[string]string{
 	"PUT /edev/{id}/frq/{frqId}": sep2Doc("FlowReservationRequest",
 		`<RequestStatus><dateTime>1700000000</dateTime><requestStatus>1</requestStatus></RequestStatus>`),
 
+	// The manager-only Registration write reads the stored record first, so a
+	// store fault surfaces there.
+	"PUT /edev/{id}/rg": sep2Doc("Registration",
+		`<dateTimeRegistered>1700000000</dateTimeRegistered><pIN>1</pIN>`),
+
 	"PUT /edev/{id}/cfg":   sep2Doc("Configuration", `<userDeviceName>probe</userDeviceName>`),
 	"PUT /edev/{id}/dstat": sep2Doc("DeviceStatus", `<changedTime>1700000000</changedTime>`),
 	"PUT /edev/{id}/ps": sep2Doc("PowerStatus",
@@ -132,6 +165,9 @@ var faultProbeBodies = map[string]string{
 	"POST /upt": sep2Doc("UsagePoint",
 		`<mRID>0A1B2C3D4E5F60718293A4B5C6D7E8F9</mRID>`+
 			`<serviceCategoryKind>0</serviceCategoryKind><status>1</status>`),
+
+	"PUT /upt/{uptId}/mr/{mrId}/rt":                sep2Doc("ReadingType", `<uom>72</uom>`),
+	"PUT /upt/{uptId}/mr/{mrId}/rs/{rsId}/r/{rId}": sep2Doc("Reading", `<value>1</value>`),
 
 	"POST /mup":         mirrorUsagePointDoc,
 	"PUT /mup/{id}":     mirrorUsagePointDoc,
@@ -191,6 +227,30 @@ func TestFaultProbeBodiesNameOnlyMountedPatterns(t *testing.T) {
 	}
 }
 
+// faultyRegistrations is the faulty Registration store with the one-call
+// Upsert the PUT route requires, failing it while the switch is armed.
+type faultyRegistrations struct {
+	store.ResourceStore[sep2.Registration]
+	inner *memory.RegistrationStore
+	fault *storetest.Fault
+}
+
+func newFaultyRegistrations(fault *storetest.Fault) *faultyRegistrations {
+	inner := memory.NewRegistrationStore()
+	return &faultyRegistrations{
+		ResourceStore: storetest.NewFaultyResourceStore[sep2.Registration](inner, fault),
+		inner:         inner,
+		fault:         fault,
+	}
+}
+
+func (s *faultyRegistrations) Upsert(ctx context.Context, id string, build func(sep2.Registration, bool) sep2.Registration) (bool, error) {
+	if err := s.fault.Err(); err != nil {
+		return false, err
+	}
+	return s.inner.Upsert(ctx, id, build)
+}
+
 // faultyStores builds a Stores whose every contract-typed field is the
 // PRODUCTION in-memory store wrapped in a fault decorator, all sharing one
 // switch.
@@ -218,9 +278,26 @@ func faultyStores(t *testing.T) (*assembly.Stores, *storetest.Fault, faultProbeD
 	device := faultProbeDevice{fault: &storetest.Fault{}, raw: memory.NewEndDeviceStore()}
 	device.ensure(t)
 
+	// The probe identity manages one device, so it is a manager and reaches the
+	// manager-only routes' handlers, where the store fault is injected.
+	managers := memory.NewEndDeviceManagementStore()
+	if err := managers.Assign(context.Background(), testLFDI, faultProbeManagedLFDI); err != nil {
+		t.Fatalf("assign the probe manager: %v", err)
+	}
+
+	faultyDevices := storetest.NewFaultyEndDeviceStore(device.raw, device.fault)
+	frpStore := storetest.NewFaultyScopedStore[sep2.FlowReservationResponse](memory.NewScopedStore[sep2.FlowReservationResponse](), fault)
+	frpLifecycles := storetest.NewFaultyScopedStore[dercontrol.LifecycleRecord](memory.NewScopedStore[dercontrol.LifecycleRecord](), fault)
+	// DELETE on a flow reservation request runs under the commitment ledger's
+	// fleet lock, so the probe stores need one. The DER control stores it
+	// reads are healthy memory stores that no route here serves.
+	ledger := sources.NewLedger(faultyDevices, managers, frpStore, frpLifecycles,
+		memory.NewScopedStore[sep2.DERControl](), memory.NewScopedStore[dercontrol.LifecycleRecord]())
+
 	return &assembly.Stores{
-		EndDevices:          storetest.NewFaultyEndDeviceStore(device.raw, device.fault),
-		Registrations:       storetest.NewFaultyResourceStore[sep2.Registration](memory.NewRegistrationStore(), fault),
+		EndDeviceManagers:   managers,
+		EndDevices:          faultyDevices,
+		Registrations:       newFaultyRegistrations(fault),
 		RegistrationPolicy:  testRegistrationPolicy(),
 		MirrorUsagePoints:   storetest.NewFaultyResourceStore[sep2.MirrorUsagePoint](memory.NewStore[sep2.MirrorUsagePoint](), fault),
 		MirrorMeterReadings: storetest.NewFaultyScopedStore[sep2.MirrorMeterReading](memory.NewScopedStore[sep2.MirrorMeterReading](), fault),
@@ -240,8 +317,9 @@ func faultyStores(t *testing.T) (*assembly.Stores, *storetest.Fault, faultProbeD
 
 		UsagePoints:   storetest.NewFaultyResourceStore[sep2.UsagePoint](memory.NewStore[sep2.UsagePoint](), fault),
 		MeterReadings: storetest.NewFaultyScopedStore[sep2.MeterReading](memory.NewScopedStore[sep2.MeterReading](), fault),
+		ReadingSets:   storetest.NewFaultyScopedStore[sep2.ReadingSet](memory.NewScopedStore[sep2.ReadingSet](), fault),
 		Readings:      storetest.NewFaultyScopedStore[sep2.Reading](memory.NewScopedStore[sep2.Reading](), fault),
-		ReadingTypes:  storetest.NewFaultyResourceStore[sep2.ReadingType](memory.NewStore[sep2.ReadingType](), fault),
+		ReadingTypes:  storetest.NewFaultyScopedStore[sep2.ReadingType](memory.NewScopedStore[sep2.ReadingType](), fault),
 
 		Configurations:           storetest.NewFaultyScopedStore[sep2.Configuration](memory.NewScopedStore[sep2.Configuration](), fault),
 		DeviceStatuses:           storetest.NewFaultyScopedStore[sep2.DeviceStatus](memory.NewScopedStore[sep2.DeviceStatus](), fault),
@@ -250,9 +328,13 @@ func faultyStores(t *testing.T) (*assembly.Stores, *storetest.Fault, faultProbeD
 		MessagingPrograms:        storetest.NewFaultyResourceStore[sep2.MessagingProgram](memory.NewStore[sep2.MessagingProgram](), fault),
 		TextMessages:             storetest.NewFaultyScopedStore[sep2.TextMessage](memory.NewScopedStore[sep2.TextMessage](), fault),
 		FlowReservationRequests:  storetest.NewFaultyScopedStore[sep2.FlowReservationRequest](memory.NewScopedStore[sep2.FlowReservationRequest](), fault),
-		FlowReservationResponses: storetest.NewFaultyScopedStore[sep2.FlowReservationResponse](memory.NewScopedStore[sep2.FlowReservationResponse](), fault),
-		ResponseSets:             storetest.NewFaultyResourceStore[sep2.ResponseSet](memory.NewStore[sep2.ResponseSet](), fault),
-		Responses:                storetest.NewFaultyScopedStore[sep2.Response](memory.NewScopedStore[sep2.Response](), fault),
+		FlowReservationResponses: frpStore,
+
+		FlowReservationResponseLifecycles: frpLifecycles,
+		CommitmentLedger:                  ledger,
+
+		ResponseSets: storetest.NewFaultyResourceStore[sep2.ResponseSet](memory.NewStore[sep2.ResponseSet](), fault),
+		Responses:    storetest.NewFaultyScopedStore[sep2.Response](memory.NewScopedStore[sep2.Response](), fault),
 	}, fault, device
 }
 
@@ -268,6 +350,9 @@ type faultProbeDevice struct {
 func (d faultProbeDevice) ensure(t *testing.T) {
 	t.Helper()
 	seedOwnedDevices(t, d.raw, faultProbePathValue)
+	if _, err := d.raw.Get(context.Background(), faultProbeManagedID); err != nil {
+		seedDevice(t, d.raw, faultProbeManagedID, faultProbeManagedLFDI, "")
+	}
 }
 
 // routePartition is the split of the router's own pattern enumeration into the
@@ -346,11 +431,15 @@ func partitionMountedRoutes(patterns []string, exclusions map[string]string) (ro
 // reached. That refusal is why adding a write route without a probe body fails
 // this test instead of passing it vacuously.
 //
-// It substitutes faultProbePathValue for every wildcard. A caller that needs
+// It substitutes faultProbePathValue for every wildcard, except in the
+// manager-only patterns, which take faultProbeManagedID. A caller that needs
 // a different, stated id (for example a specific EndDevice to compare a
 // manager's answer against its owner's) calls probeRequestForID directly
 // instead of relying on faultProbePathValue's value matching by coincidence.
 func probeRequestFor(base, pattern string) (*http.Request, error) {
+	if faultProbeManagerOnly[pattern] {
+		return probeRequestForID(base, pattern, faultProbeManagedID)
+	}
 	return probeRequestForID(base, pattern, faultProbePathValue)
 }
 
